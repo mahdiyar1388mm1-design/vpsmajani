@@ -54,6 +54,7 @@ jobs:
           Set-Content "$p\Desktop\notes.txt"        'my notes from session 1' -Encoding UTF8
           Set-Content "$p\Desktop\project\app.ps1"  'Write-Host "kept"' -Encoding UTF8
           Set-Content "$p\Documents\todo.md"        "- buy vps`n- never lose files" -Encoding UTF8
+          New-Item -ItemType Directory -Force -Path "$p\Documents" | Out-Null
           New-Item -ItemType Directory -Force -Path "$p\Downloads" | Out-Null
           # 3 MB of pseudo-random data to make the transfer non-trivial
           $bytes = New-Object byte[] (3MB)
@@ -141,12 +142,20 @@ jobs:
           curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/snapshot -o "$RUNNER_TEMP/again.tar.gz"
           tar -tzf "$RUNNER_TEMP/again.tar.gz" | head -5
 
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sync-test-logs
-          path: |
-            C:\vpsmajani-sync\log
-            C:\vpsmajani-sync\state
-          if-no-files-found: ignore
+      - name: Report outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "STATUS: ${{ job.status }}"
+            echo "--- server.log ---"
+            cat "$RUNNER_TEMP/server.log" || true
+            echo "--- snapshot dir ---"
+            ls -la "$RUNNER_TEMP/vol" || true
+            echo "--- save/restore state ---"
+            cat /c/vpsmajani-sync/state/status.txt 2>/dev/null || echo "(no status file)"
+            echo "--- preserved paths ---"
+            cat /c/vpsmajani-sync/last-save.txt 2>/dev/null || echo "(no last-save.txt)"
+            echo "--- what survived in the profile ---"
+            find /c/Users/SyncTestUser -maxdepth 3 2>/dev/null | head -40 || true
+          } | tee "$RUNNER_TEMP/report.txt"
