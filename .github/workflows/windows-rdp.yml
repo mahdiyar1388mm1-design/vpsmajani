@@ -43,10 +43,10 @@ env:
   TAILSCALE_HOSTNAME: "github-rdp-server"
   # How long each session holds the machine (the job timeout is 55 min).
   SESSION_KEEPALIVE_MINUTES: "40"
-  # Safety valve. Number of sessions before the chain stops by itself
-  # (~45 min per session, so 500 sessions ≈ 15 days). Set the repository
-  # variable MAX_CHAIN to 0 for a truly endless chain.
-  MAX_CHAIN: ${{ vars.MAX_CHAIN || '500' }}
+  # 0 = unlimited (the default): the chain keeps re-spawning forever.
+  # Set the repository variable MAX_CHAIN to a number if you ever want it
+  # to stop itself after that many sessions (~45 min each).
+  MAX_CHAIN: ${{ vars.MAX_CHAIN || '0' }}
 
 jobs:
   # -------------------------------------------------------------------------
@@ -235,7 +235,9 @@ jobs:
 
           if ! [[ "$CHAIN" =~ ^[0-9]+$ ]]; then CHAIN=1; fi
           next_chain=$((CHAIN + 1))
-          limit="${MAX_CHAIN:-500}"
+          limit="${MAX_CHAIN:-0}"
+          # Anything that is not a number (empty, typo, "unlimited") = endless.
+          if ! [[ "$limit" =~ ^[0-9]+$ ]]; then limit=0; fi
 
           # MAX_CHAIN=0 means unlimited.
           if [ "$limit" != "0" ] && [ "$CHAIN" -ge "$limit" ]; then
