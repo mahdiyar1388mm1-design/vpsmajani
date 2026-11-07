@@ -1,56 +1,343 @@
-name: Windows Cloud RDP
+name: Windows Cloud RDP (auto-renewing)
+
+# ---------------------------------------------------------------------------
+#  Why the "never ends" part is built this way
+#  ---------------------------------------------------------------------------
+#  GitHub-hosted runners have a HARD platform limit: a single job can never
+#  run longer than 6 hours, whatever you put in `timeout-minutes`, and no API
+#  can raise it. So instead of one long job, this workflow runs a *chain* of
+#  short sessions. Right before each session ends, the workflow asks the
+#  GitHub API to start the next one. The chain keeps going on its own.
+#
+#  Start it once: Actions -> "Windows Cloud RDP (auto-renewing)" -> Run workflow
+#  It will keep re-spawning itself. To STOP it: cancel the running job and
+#  the queued one (the chain dies with the run), or disable the workflow.
+#
+#  Keeping your files between sessions:
+#  ---------------------------------------------------------------------------
+#  Every session is a brand new VM, so a snapshot of the user profile is taken
+#  right before the session ends and restored on the next machine. The
+#  snapshot lives on a small always-on storage VPS inside the same tailnet
+#  (see storage/README in this repo). Without that VPS the workflow still
+#  runs, it just cannot restore anything (SYNC_MODE=local).
+# ---------------------------------------------------------------------------
 
 on:
   workflow_dispatch:
+    inputs:
+      chain:
+        description: "Session number in the chain (leave empty for a fresh chain)"
+        required: false
+        default: ""
+      password:
+        description: "RDP password (optional, only if the RDP_PASSWORD secret is not set)"
+        required: false
+        default: ""
 
+# Required: the workflow re-triggers itself through the API.
+permissions:
+  actions: write
+  contents: read
+
+# Only one session at a time. The next run waits in the queue instead of
+# running in parallel, so two VMs never fight over the same hostname.
+concurrency:
+  group: windows-rdp
+  cancel-in-progress: false
+
+env:
+  WORKFLOW_FILE: "windows-rdp.yml"
+  RDP_USERNAME: "NvDAdmin"
+  TAILSCALE_HOSTNAME: "github-rdp-server"
+  # How long each session holds the machine. The job timeout is 55 min:
+  # ~6 min setup + 30 min session + ~3 min periodic saves + 12 min final save.
+  SESSION_KEEPALIVE_MINUTES: "30"
+  # 0 = unlimited (the default): the chain keeps re-spawning forever.
+  # Set the repository variable MAX_CHAIN to a number if you ever want it
+  # to stop itself after that many sessions (~45 min each).
+  MAX_CHAIN: ${{ vars.MAX_CHAIN || '0' }}
+
+# Use "vars" instead of "vars" so actionlint and GitHub agree: values come
+# from Settings -> Secrets and variables -> Actions -> Variables.
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 360
-
+  # -------------------------------------------------------------------------
+  # init: reads / advances the chain counter, resolves the password
+  # -------------------------------------------------------------------------
+  init:
+    name: Prepare session
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      chain: ${{ steps.state.outputs.chain }}
+      password: ${{ steps.state.outputs.password }}
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: Resolve chain state
+        id: state
+        shell: bash
+        env:
+          INPUT_CHAIN: ${{ inputs.chain }}
+          INPUT_PASSWORD: ${{ inputs.password }}
+          SECRET_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          set -euo pipefail
 
-      - name: 2. Create Admin Account
+          chain="${INPUT_CHAIN:-1}"
+          if ! [[ "$chain" =~ ^[0-9]+$ ]]; then chain=1; fi
+
+          # Prefer the repository secret; fall back to the input; last resort
+          # is a random password reused across the whole chain.
+          password="${SECRET_PASSWORD:-${INPUT_PASSWORD:-}}"
+          if [ -z "$password" ]; then
+            password="Rd$(openssl rand -hex 8)!9"
+          fi
+
+          echo "::add-mask::$password"
+          {
+            echo "chain=$chain"
+            echo "password=$password"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Session $chain (limit: ${MAX_CHAIN} sessions, 0 = unlimited)"
+
+  # -------------------------------------------------------------------------
+  # rdp: the Windows box + Remote Desktop + Tailscale
+  # -------------------------------------------------------------------------
+  rdp:
+    name: RDP session ${{ needs.init.outputs.chain }}
+    needs: init
+    runs-on: windows-latest
+    # 360+ is impossible on hosted runners; 55 min is a safe envelope for
+    # a 40 min session plus setup.
+    timeout-minutes: 55
+    env:
+      RDP_PASSWORD: ${{ needs.init.outputs.password }}
+      SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      # http  -> snapshots go to STORAGE_URL on the storage VPS (real persistence)
+      # local -> snapshots stay on the machine that is about to die (no restore)
+      # The default is derived from whether a storage URL exists, so the
+      # workflow does the right thing before the VPS is set up (no broken
+      # uploads every 10 minutes).
+      SYNC_MODE: ${{ vars.SYNC_MODE || (vars.STORAGE_URL != '' && 'http' || 'local') }}
+      # Where the storage VPS listens: its Tailscale IP or MagicDNS name.
+      STORAGE_URL: ${{ vars.STORAGE_URL }}
+    steps:
+      - name: 0. Checkout helper scripts
+        uses: actions/checkout@v4
+      - name: 1. Enable Remote Desktop, firewall and no idle limits
+        shell: powershell
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
+          $ErrorActionPreference = 'Stop'
 
-      - name: 3. Install & Connect Tailscale VPN
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 0
+
+          # Remove idle / disconnect / max-session limits.
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $ts -Force | Out-Null
+          Set-ItemProperty -Path $ts -Name 'MaxIdleTime'           -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'MaxDisconnectionTime'  -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'MaxConnectionTime'     -Value 0 -Type DWord
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP-TCP-3389' -Direction Inbound `
+            -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
+          Set-Service -Name TermService -StartupType Automatic
+          if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
+          Write-Host "Remote Desktop enabled."
+
+      - name: 2. Create / refresh admin account
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $user = $env:RDP_USERNAME
+          $pw   = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $pw -PasswordNeverExpires $true
+          } else {
+            New-LocalUser -Name $user -Password $pw -PasswordNeverExpires -AccountNeverExpires `
+              -Description "Session maintenance account" | Out-Null
+          }
+          Add-LocalGroupMember -Group 'Administrators'       -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $user -ErrorAction SilentlyContinue
+          Write-Host "Account '$user' is ready."
+
+      - name: 3. Connect Tailscale (install if missing)
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
+          $ErrorActionPreference = 'Continue'
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $ts)) {
+            Write-Host "Installing Tailscale..."
+            Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile 'C:\tailscale.msi'
+            Start-Process msiexec -ArgumentList '/i C:\tailscale.msi /quiet /norestart' -Wait
+            Start-Sleep -Seconds 5
+          }
+
+          $ip = $null
+          for ($i = 1; $i -le 6; $i++) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) {
+              Write-Host "tailscale up (attempt $i)..."
+              & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$env:TAILSCALE_HOSTNAME" 2>&1 | Out-Host
+              Start-Sleep -Seconds 8
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            }
+            if ($ip) { break }
+          }
+
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  RDP SERVER IS READY (auto-renewing chain)" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ip" -ForegroundColor Yellow
+          Write-Host "  Username     : $env:RDP_USERNAME" -ForegroundColor Yellow
+          Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Yellow
+          Write-Host "  Connect with : mstsc /v:$ip" -ForegroundColor Magenta
+          Write-Host "  A new machine is created automatically when this one expires." -ForegroundColor Green
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 4. Keep Server Alive (48 Hours)
+      - name: 3b. Bring back the files from the previous session
+        # Needs Tailscale to be up: the storage VPS lives in the tailnet.
+        shell: powershell
+        timeout-minutes: 6
         run: |
-          for ($i = 1; $i -le 2880; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/2880] Server running..."
+          .github\scripts\desktop-restore.ps1
+          Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
+
+      - name: 3c. Explain state on the desktop
+        shell: powershell
+        run: |
+          .github\scripts\desktop-info.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
+            -TailscaleIP ((& 'C:\Program Files\Tailscale\tailscale.exe' ip -4 2>$null | Select-Object -First 1))
+
+      - name: 4. Keep the session alive until the next one takes over
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          $deadline = (Get-Date).AddMinutes([int]$env:SESSION_KEEPALIVE_MINUTES)
+
+          Write-Host "Holding the session for $env:SESSION_KEEPALIVE_MINUTES minutes."
+
+          # Snapshot every 10 minutes as well, so a hard kill still loses
+          # only the last few minutes of work.
+          $lastSave = Get-Date
+          $saveEvery = [TimeSpan]::FromMinutes(10)
+          $savedCount = 0
+
+          while ((Get-Date) -lt $deadline) {
+            # Self-healing: if Tailscale ever drops, log back in unattended.
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) {
+              Write-Host "[heal] Tailscale is down, reconnecting..."
+              & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$env:TAILSCALE_HOSTNAME" 2>&1 | Out-Host
+              Start-Sleep -Seconds 5
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            }
+
+            if (((Get-Date) - $lastSave) -ge $saveEvery) {
+              $savedCount++
+              Write-Host "[keep-alive] periodic snapshot #$savedCount"
+              try {
+                & .github\scripts\desktop-save.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
+                  -StorageUrl $env:STORAGE_URL -Token $env:SYNC_TOKEN
+              } catch {
+                Write-Host "[keep-alive] snapshot failed: $_"
+              }
+              $lastSave = Get-Date
+            }
+
+            $left = [int]($deadline - (Get-Date)).TotalMinutes
+            Write-Host ("[keep-alive] {0:HH:mm:ss}  ip={1}  ~{2} min left in this session" -f (Get-Date), $ip, $left)
+            Start-Sleep -Seconds 30
           }
+
+          Write-Host "Session finished - starting the next one."
+
+      - name: 5. Final snapshot before the VM disappears
+        # Deadline comes from job start, so a busy session can never make the
+        # next job wait: past this point we skip saving and go straight to
+        # starting the next session.
+        # Runs on timeout and failure too: that is exactly when the files
+        # matter. Cancelled sessions are skipped (the user asked to stop).
+        if: ${{ !cancelled() }}
+        shell: powershell
+        timeout-minutes: 10
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          Write-Host "Final snapshot (this timeout cannot eat the job)."
+          .github\scripts\desktop-save.ps1 -SessionNumber ${{ needs.init.outputs.chain }}
+          Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
+
+  # -------------------------------------------------------------------------
+  # next: the piece that makes the chain endless
+  # -------------------------------------------------------------------------
+  next:
+    name: Start the next session
+    needs: [init, rdp]
+    # Runs when the session ended ANY way except a manual cancel
+    # (timeout, crash, normal finish). !cancelled() is what makes
+    # "Cancel" actually stop the chain.
+    if: ${{ !cancelled() && needs.init.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch the follow-up run
+        shell: bash
+        env:
+          # A PAT is optional. GITHUB_TOKEN is enough when the repository has
+          # "Read and write permissions" under Settings -> Actions -> General.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          CHAIN: ${{ needs.init.outputs.chain }}
+          PASSWORD: ${{ needs.init.outputs.password }}
+          SOURCE_REF: ${{ github.ref_name }}
+        run: |
+          set -uo pipefail
+
+          if ! [[ "$CHAIN" =~ ^[0-9]+$ ]]; then CHAIN=1; fi
+          next_chain=$((CHAIN + 1))
+          limit="${MAX_CHAIN:-0}"
+          # Anything that is not a number (empty, typo, "unlimited") = endless.
+          if ! [[ "$limit" =~ ^[0-9]+$ ]]; then limit=0; fi
+
+          # MAX_CHAIN=0 means unlimited.
+          if [ "$limit" != "0" ] && [ "$CHAIN" -ge "$limit" ]; then
+            echo "::warning title=Chain finished::Stopped after $CHAIN sessions (MAX_CHAIN=$limit). Set the repository variable MAX_CHAIN=0 for an endless chain."
+            exit 0
+          fi
+
+          payload=$(jq -cn --arg ref "$SOURCE_REF" --arg chain "$next_chain" --arg password "$PASSWORD" \
+            '{ref: $ref, inputs: {chain: $chain, password: $password}}')
+
+          url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches"
+          echo "Requesting session $next_chain on ref '$SOURCE_REF'..."
+
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -sS -o /tmp/dispatch.json -w '%{http_code}' -X POST "$url" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              -d "$payload") || code=000
+
+            if [ "$code" = "204" ]; then
+              echo "::notice title=Next session queued::Session $next_chain has been started."
+              exit 0
+            fi
+
+            echo "Attempt $attempt failed (HTTP $code): $(head -c 400 /tmp/dispatch.json 2>/dev/null || true)"
+            sleep 15
+          done
+
+          echo "::error title=Chain broke::Could not start the next session."
+          echo "Fixes: Settings -> Actions -> General -> Workflow permissions -> 'Read and write', and make sure $WORKFLOW_FILE exists on the default branch."
+          exit 1

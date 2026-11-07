@@ -1,0 +1,214 @@
+name: Test desktop save/restore
+
+# End-to-end test of the persistence layer on a real Windows machine:
+#   seed a fake profile -> desktop-save.ps1 -> HTTP snapshot server ->
+#   desktop-restore.ps1 into a different folder -> byte-for-byte compare.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/scripts-test.yml"
+  push:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/scripts-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    name: Save -> server -> restore roundtrip
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python for the snapshot server
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start snapshot server
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/vol"
+          SNAP_DIR="$RUNNER_TEMP/vol" SNAP_KEEP=3 SYNC_TOKEN=testtoken \
+            BIND_ADDR=127.0.0.1 BIND_PORT=8787 \
+            python .github/scripts/sync_server.py > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 40); do
+            curl -sf -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/health && break
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/server.log"
+
+      - name: Seed a fake user profile
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $fakeUser = 'SyncTestUser'
+            $p = "C:\Users\$fakeUser"
+            Write-Host "seeding into $p"
+            New-Item -ItemType Directory -Force -Path "$p\Desktop\project" | Out-Null
+            Set-Content "$p\Desktop\notes.txt"        'my notes from session 1' -Encoding UTF8
+            Set-Content "$p\Desktop\project\app.ps1"  'Write-Host "kept"' -Encoding UTF8
+            New-Item -ItemType Directory -Force -Path "$p\Documents" | Out-Null
+            Set-Content "$p\Documents\todo.md"        "- buy vps`n- never lose files" -Encoding UTF8
+            New-Item -ItemType Directory -Force -Path "$p\Downloads" | Out-Null
+            $bytes = New-Object byte[] (3MB)
+            $rng = New-Object System.Random 42
+            $rng.NextBytes($bytes)
+            [IO.File]::WriteAllBytes("$p\Downloads\blob.bin", $bytes)
+            New-Item -ItemType Directory -Force -Path "$p\AppData\Local\Temp" | Out-Null
+            Set-Content "$p\AppData\Local\Temp\junk.tmp" 'should not be saved'
+            Write-Host "seeded $p"
+          } catch {
+            Write-Host "::error::SEED FAILED: $($_.Exception.Message) [$(($_.InvocationInfo.PositionMessage -split "`n")[1].Trim())]"
+            exit 1
+          }
+
+      - name: Save (upload snapshot)
+        shell: powershell
+        env:
+          SYNC_MODE: http
+          SYNC_PROFILE_USER: SyncTestUser
+          STORAGE_URL: http://127.0.0.1:8787
+          SYNC_TOKEN: testtoken
+        run: |
+          try {
+            .\.github\scripts\desktop-save.ps1 -SessionNumber 1
+            if ($LASTEXITCODE -ne 0) { throw "save script exited $LASTEXITCODE" }
+          } catch {
+            Write-Host "::error::SAVE FAILED: $($_.Exception.Message)"
+            Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "status: $_" }
+            exit 1
+          }
+          Write-Host '--- status ---'; Get-Content C:\vpsmajani-sync\state\status.txt
+
+      - name: Server has the snapshot
+        shell: bash
+        run: |
+          set -x
+          curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/meta -o "$RUNNER_TEMP/meta.json"
+          echo "--- meta.json ---"
+          cat "$RUNNER_TEMP/meta.json"; echo
+          python - <<'PY' || { echo "::error title=META CHECK FAILED::see meta.json above"; exit 1; }
+          import json, os, sys
+          raw = open(os.environ['RUNNER_TEMP'] + '/meta.json').read()
+          try:
+              meta = json.loads(raw)
+          except Exception as e:
+              print('::error title=META IS NOT JSON::' + raw[:400])
+              sys.exit(1)
+          problems = []
+          if meta.get('bytes', 0) <= 100_000: problems.append('bytes too small: %s' % meta.get('bytes'))
+          if meta.get('format') != 'tar.gz': problems.append('format is %r' % meta.get('format'))
+          if len(str(meta.get('sha256', ''))) != 64: problems.append('sha256 is %r' % meta.get('sha256'))
+          origin = meta.get('origin') or {}
+          if origin.get('session') != '1': problems.append('origin.session is %r' % origin.get('session'))
+          if problems:
+              print('::error title=META CHECK FAILED::' + '; '.join(problems))
+              sys.exit(1)
+          print('meta ok, origin host:', origin.get('host'))
+          PY
+      - name: Restore into a different profile
+        shell: powershell
+        env:
+          SYNC_MODE: http
+          SYNC_PROFILE_USER: SyncTestUser
+          STORAGE_URL: http://127.0.0.1:8787
+          SYNC_TOKEN: testtoken
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # simulate a brand new machine: wipe the profile entirely
+          Remove-Item -Recurse -Force 'C:\Users\SyncTestUser' -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path 'C:\Users\SyncTestUser' | Out-Null
+
+          .\.github\scripts\desktop-restore.ps1
+          if ($LASTEXITCODE -ne 0) { throw "restore script exited $LASTEXITCODE" }
+
+          $p = 'C:\Users\SyncTestUser'
+          $checks = @(
+            @{ Path = "$p\Desktop\notes.txt";       Expect = 'my notes from session 1' }
+            @{ Path = "$p\Desktop\project\app.ps1"; Expect = 'Write-Host "kept"' }
+            @{ Path = "$p\Documents\todo.md";       Expect = '- buy vps' }
+          )
+          foreach ($c in $checks) {
+            if (-not (Test-Path $c.Path)) { throw "MISSING after restore: $($c.Path)" }
+            $content = Get-Content $c.Path -Raw
+            if ($content -notlike "*$($c.Expect)*") { throw "WRONG content in $($c.Path): $content" }
+            Write-Host "OK restored $($c.Path)"
+          }
+
+          if (-not (Test-Path "$p\Downloads\blob.bin")) { throw 'MISSING: blob.bin' }
+          $len = (Get-Item "$p\Downloads\blob.bin").Length
+          if ($len -ne 3MB) { throw "blob.bin size mismatch: $len" }
+          Write-Host "OK restored blob.bin ($len bytes)"
+
+          if (Test-Path "$p\AppData\Local\Temp\junk.tmp") { throw 'cache file was wrongly restored' }
+          Write-Host 'OK cache excluded as intended'
+
+          Write-Host '--- status after restore ---'; Get-Content C:\vpsmajani-sync\state\status.txt
+
+      - name: Corrupt upload is rejected and previous snapshot survives
+        shell: bash
+        env:
+          URL: http://127.0.0.1:8787
+        run: |
+          set -uo pipefail
+          fail() { echo "::error title=CORRUPT-UPLOAD CHECK FAILED::$*"; exit 1; }
+
+          # msys tar reads "D:" in a Windows path as a remote host name.
+          W=$(cygpath -u "$RUNNER_TEMP")
+          cd "$W"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            -H 'Authorization: Bearer testtoken' --data-binary 'not an archive' \
+            "$URL/snapshot") || code=000
+          echo "corrupt upload -> HTTP $code (want 415)"
+          [ "$code" = "415" ] || fail "server answered $code, expected 415"
+
+          # The good snapshot must still be the newest one.
+          curl -s -H 'Authorization: Bearer testtoken' "$URL/snapshot" -o again.tar.gz \
+            || fail "could not download the newest snapshot"
+          ls -l again.tar.gz
+          if ! tar -tzf again.tar.gz > list.txt 2> tarerr.txt; then
+            echo "::error title=TAR LIST FAILED::$(head -c 300 tarerr.txt)"
+            head -c 16 again.tar.gz | od -An -tx1
+            curl -s -H 'Authorization: Bearer testtoken' "$URL/meta"
+            exit 1
+          fi
+          head -5 list.txt
+          tar -xzOf again.tar.gz -- 'Users/SyncTestUser/Desktop/notes.txt' > notes.out 2>&1 \
+            || fail "could not extract notes.txt from the snapshot"
+          grep -q 'my notes' notes.out || fail "snapshot lost the content of notes.txt"
+          echo "notes.txt came back from the server: $(cat notes.out)"
+
+          meta=$(curl -s -H 'Authorization: Bearer testtoken' "$URL/meta")
+          echo "meta after corrupt upload: $meta"
+          echo "$meta" | grep -q '"format": "tar.gz"' || fail "meta no longer describes a tar.gz snapshot"
+
+          echo "corrupt upload ignored, good snapshot intact"
+
+      - name: Report outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "STATUS: ${{ job.status }}"
+            echo "--- server.log ---"
+            cat "$RUNNER_TEMP/server.log" || true
+            echo "--- snapshot dir ---"
+            ls -la "$RUNNER_TEMP/vol" || true
+            echo "--- save/restore state ---"
+            cat /c/vpsmajani-sync/state/status.txt 2>/dev/null || echo "(no status file)"
+            echo "--- last-save marker ---"
+            cat /c/vpsmajani-sync/tmp/last-save.txt 2>/dev/null || echo "(no marker)"
+            echo "--- local archives ---"
+            ls -la /c/vpsmajani-sync/*.tar* /c/vpsmajani-sync/*.7z 2>/dev/null || echo "(none)"
+            echo "--- what survived in the profile ---"
+            find /c/Users/SyncTestUser -maxdepth 3 2>/dev/null | head -40 || true
+          } | tee "$RUNNER_TEMP/report.txt"
