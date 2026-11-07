@@ -55,12 +55,7 @@ env:
   # Set the repository variable MAX_CHAIN to a number if you ever want it
   # to stop itself after that many sessions (~45 min each).
   MAX_CHAIN: ${{ vars.MAX_CHAIN || '0' }}
-  # http  -> snapshots go to STORAGE_URL on the storage VPS  (real persistence)
-  # local -> snapshots stay on the machine that is about to die (no restore)
-  SYNC_MODE: ${{ vars.SYNC_MODE || 'http' }}
-  # Where the storage VPS listens. Use its Tailscale name or IP.
-  STORAGE_URL: ${{ vars.STORAGE_URL }}
-  # Give the snapshot this many seconds before the job is killed.
+  # Give the final snapshot this many seconds before the job is killed.
   SYNC_BUDGET_SECONDS: "420"
 
 # Use "vars" instead of "vars" so actionlint and GitHub agree: values come
@@ -118,6 +113,11 @@ jobs:
     env:
       RDP_PASSWORD: ${{ needs.init.outputs.password }}
       SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      # http  -> snapshots go to STORAGE_URL on the storage VPS (real persistence)
+      # local -> snapshots stay on the machine that is about to die (no restore)
+      SYNC_MODE: ${{ vars.SYNC_MODE || 'http' }}
+      # Where the storage VPS listens: its Tailscale IP or MagicDNS name.
+      STORAGE_URL: ${{ vars.STORAGE_URL }}
     steps:
       - name: 0. Checkout helper scripts
         uses: actions/checkout@v4
@@ -165,9 +165,6 @@ jobs:
 
       - name: 2b. Bring back the files from the previous session
         shell: powershell
-        env:
-          SYNC_MODE: ${{ env.SYNC_MODE }}
-          STORAGE_URL: ${{ env.STORAGE_URL }}
         run: |
           .\scripts\desktop-restore.ps1
           Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
@@ -211,9 +208,6 @@ jobs:
 
       - name: 3b. Explain state on the desktop
         shell: powershell
-        env:
-          SYNC_MODE: ${{ env.SYNC_MODE }}
-          STORAGE_URL: ${{ env.STORAGE_URL }}
         run: |
           .\scripts\desktop-info.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
             -TailscaleIP ((& 'C:\Program Files\Tailscale\tailscale.exe' ip -4 2>$null | Select-Object -First 1))
@@ -222,8 +216,6 @@ jobs:
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          SYNC_MODE: ${{ env.SYNC_MODE }}
-          STORAGE_URL: ${{ env.STORAGE_URL }}
         run: |
           $ErrorActionPreference = 'Continue'
           $ts = 'C:\Program Files\Tailscale\tailscale.exe'
@@ -267,14 +259,15 @@ jobs:
           Write-Host "Session finished - starting the next one."
 
       - name: 5. Final snapshot before the VM disappears
+        # Deadline comes from job start, so a busy session can never make the
+        # next job wait: past this point we skip saving and go straight to
+        # starting the next session.
         # Runs on timeout and failure too: that is exactly when the files
         # matter. Cancelled sessions are skipped (the user asked to stop).
         if: ${{ !cancelled() }}
         shell: powershell
         timeout-minutes: 10
         env:
-          SYNC_MODE: ${{ env.SYNC_MODE }}
-          STORAGE_URL: ${{ env.STORAGE_URL }}
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           Write-Host "Final snapshot (this timeout cannot eat the job)."
