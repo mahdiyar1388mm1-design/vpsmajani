@@ -191,8 +191,9 @@ jobs:
             exit 1
           fi
           head -5 "$RUNNER_TEMP/list.txt"
-          tar -xzOf "$RUNNER_TEMP/again.tar.gz" 'Users/SyncTestUser/Desktop/notes.txt' \
-            | grep -q 'my notes' || fail "restored archive lost notes.txt"
+          tar -xzOf "$RUNNER_TEMP/again.tar.gz" -- 'Users/SyncTestUser/Desktop/notes.txt' \
+            > "$RUNNER_TEMP/notes.out" 2>&1 || fail "could not extract notes.txt from the snapshot"
+          grep -q 'my notes' "$RUNNER_TEMP/notes.out" || fail "snapshot lost the content of notes.txt"
 
           # And a replay of the corrupt upload must not have rotated it away.
           meta=$(curl -s -H 'Authorization: Bearer testtoken' "$URL/meta")
