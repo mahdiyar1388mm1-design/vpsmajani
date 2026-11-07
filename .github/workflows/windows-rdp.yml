@@ -63,9 +63,11 @@ env:
   # Give the snapshot this many seconds before the job is killed.
   SYNC_BUDGET_SECONDS: "420"
 
+# Use "vars" instead of "vars" so actionlint and GitHub agree: values come
+# from Settings -> Secrets and variables -> Actions -> Variables.
 jobs:
   # -------------------------------------------------------------------------
-  init: read / advance the chain counter, resolve the password
+  # init: reads / advances the chain counter, resolves the password
   # -------------------------------------------------------------------------
   init:
     name: Prepare session
@@ -104,7 +106,7 @@ jobs:
           echo "Session $chain (limit: ${MAX_CHAIN} sessions, 0 = unlimited)"
 
   # -------------------------------------------------------------------------
-  rdp: the Windows box + Remote Desktop + Tailscale
+  # rdp: the Windows box + Remote Desktop + Tailscale
   # -------------------------------------------------------------------------
   rdp:
     name: RDP session ${{ needs.init.outputs.chain }}
@@ -280,7 +282,7 @@ jobs:
           Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
 
   # -------------------------------------------------------------------------
-  next: the piece that makes the chain endless
+  # next: the piece that makes the chain endless
   # -------------------------------------------------------------------------
   next:
     name: Start the next session
