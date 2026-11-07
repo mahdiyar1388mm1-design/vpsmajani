@@ -171,6 +171,10 @@ jobs:
           set -uo pipefail
           fail() { echo "::error title=CORRUPT-UPLOAD CHECK FAILED::$*"; exit 1; }
 
+          # msys tar reads "D:" in a Windows path as a remote host name.
+          W=$(cygpath -u "$RUNNER_TEMP")
+          cd "$W"
+
           code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
             -H 'Authorization: Bearer testtoken' --data-binary 'not an archive' \
             "$URL/snapshot") || code=000
@@ -178,24 +182,21 @@ jobs:
           [ "$code" = "415" ] || fail "server answered $code, expected 415"
 
           # The good snapshot must still be the newest one.
-          curl -s -H 'Authorization: Bearer testtoken' "$URL/snapshot" -o "$RUNNER_TEMP/again.tar.gz" \
+          curl -s -H 'Authorization: Bearer testtoken' "$URL/snapshot" -o again.tar.gz \
             || fail "could not download the newest snapshot"
-          ls -l "$RUNNER_TEMP/again.tar.gz"
-          file "$RUNNER_TEMP/again.tar.gz" || true
-          if ! tar -tzf "$RUNNER_TEMP/again.tar.gz" > "$RUNNER_TEMP/list.txt" 2> "$RUNNER_TEMP/tarerr.txt"; then
-            echo "::error title=TAR LIST FAILED::$(head -c 300 "$RUNNER_TEMP/tarerr.txt")"
-            echo "size=$(stat -c%s "$RUNNER_TEMP/again.tar.gz") bytes"
-            head -c 16 "$RUNNER_TEMP/again.tar.gz" | od -An -tx1
+          ls -l again.tar.gz
+          if ! tar -tzf again.tar.gz > list.txt 2> tarerr.txt; then
+            echo "::error title=TAR LIST FAILED::$(head -c 300 tarerr.txt)"
+            head -c 16 again.tar.gz | od -An -tx1
             curl -s -H 'Authorization: Bearer testtoken' "$URL/meta"
-            curl -s -H 'Authorization: Bearer testtoken' "$URL/stats"
             exit 1
           fi
-          head -5 "$RUNNER_TEMP/list.txt"
-          tar -xzOf "$RUNNER_TEMP/again.tar.gz" -- 'Users/SyncTestUser/Desktop/notes.txt' \
-            > "$RUNNER_TEMP/notes.out" 2>&1 || fail "could not extract notes.txt from the snapshot"
-          grep -q 'my notes' "$RUNNER_TEMP/notes.out" || fail "snapshot lost the content of notes.txt"
+          head -5 list.txt
+          tar -xzOf again.tar.gz -- 'Users/SyncTestUser/Desktop/notes.txt' > notes.out 2>&1 \
+            || fail "could not extract notes.txt from the snapshot"
+          grep -q 'my notes' notes.out || fail "snapshot lost the content of notes.txt"
+          echo "notes.txt came back from the server: $(cat notes.out)"
 
-          # And a replay of the corrupt upload must not have rotated it away.
           meta=$(curl -s -H 'Authorization: Bearer testtoken' "$URL/meta")
           echo "meta after corrupt upload: $meta"
           echo "$meta" | grep -q '"format": "tar.gz"' || fail "meta no longer describes a tar.gz snapshot"
