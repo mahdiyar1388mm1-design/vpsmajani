@@ -31,7 +31,9 @@ function Initialize-SyncWorkDir {
 # Downloads, Pictures, Videos, AppData (browser profiles, chat history...).
 # Paths are relative to C:\ so the archive restores back to the same place.
 function Get-PreservedPaths {
-    return @(".?:\Users\$(Get-ProfileUser)")
+    # Relative to C:\ on purpose: tar is run with -C C:\ and drive-letter
+    # prefixes inside the archive would break the restore path.
+    return @("Users\$(Get-ProfileUser)")
 }
 
 # Excludes are tar patterns relative to C:\ (the archive root).

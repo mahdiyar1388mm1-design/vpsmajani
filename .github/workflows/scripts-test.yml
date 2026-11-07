@@ -186,8 +186,10 @@ jobs:
             ls -la "$RUNNER_TEMP/vol" || true
             echo "--- save/restore state ---"
             cat /c/vpsmajani-sync/state/status.txt 2>/dev/null || echo "(no status file)"
-            echo "--- preserved paths ---"
-            cat /c/vpsmajani-sync/last-save.txt 2>/dev/null || echo "(no last-save.txt)"
+            echo "--- last-save marker ---"
+            cat /c/vpsmajani-sync/tmp/last-save.txt 2>/dev/null || echo "(no marker)"
+            echo "--- local archives ---"
+            ls -la /c/vpsmajani-sync/*.tar* /c/vpsmajani-sync/*.7z 2>/dev/null || echo "(none)"
             echo "--- what survived in the profile ---"
             find /c/Users/SyncTestUser -maxdepth 3 2>/dev/null | head -40 || true
           } | tee "$RUNNER_TEMP/report.txt"

@@ -92,6 +92,7 @@ if ($tarExe) {
     try {
         & $tarExe @args 2>&1 | ForEach-Object { Say "   $_" }
         $ok = ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1)   # 1 = some files vanished mid-run
+        if (-not $ok) { Say "[save] tar exit code: $LASTEXITCODE" }
     } catch {
         Say "[save] tar error: $_"
         $ok = $false
@@ -156,18 +157,18 @@ if ($mode -eq 'http') {
         if ($Token) { $headers['Authorization'] = "Bearer $Token" }
 
         try {
-            Say "[save] uploading to $StorageUrl/snapshot ..."
-            $r = Invoke-RestMethod -Method Put -Uri "$StorageUrl/snapshot" -Headers $headers `
-                -InFile $archive -ContentType 'application/octet-stream' -TimeoutSec 900
-            Say "[save] uploaded: $($r | ConvertTo-Json -Compress)"
-
-            # Ship the marker too; not fatal if it fails.
+            # Marker first: the snapshot's metadata on the server includes it.
             try {
                 Invoke-RestMethod -Method Put -Uri "$StorageUrl/marker" -Headers $headers `
                     -InFile $markerFile -ContentType 'text/plain' -TimeoutSec 60 | Out-Null
             } catch {
                 Say "[save] marker upload skipped: $($_.Exception.Message)"
             }
+
+            Say "[save] uploading to $StorageUrl/snapshot ..."
+            $r = Invoke-RestMethod -Method Put -Uri "$StorageUrl/snapshot" -Headers $headers `
+                -InFile $archive -ContentType 'application/octet-stream' -TimeoutSec 900
+            Say "[save] uploaded: $($r | ConvertTo-Json -Compress)"
             $sent = $true
         } catch {
             Write-Host "::warning title=Snapshot not uploaded::Upload failed: $($_.Exception.Message)"
