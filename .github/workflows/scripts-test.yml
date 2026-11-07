@@ -44,16 +44,6 @@ jobs:
           done
           cat "$RUNNER_TEMP/server.log"
 
-      - name: TEMP debug environment
-        shell: bash
-        run: |
-          echo "pwd=$(pwd)"
-          ls .github/scripts
-          echo "--- C:/Users ---"
-          ls C:/Users || true
-          echo "--- whoami ---"
-          whoami || true
-
       - name: Seed a fake user profile
         shell: powershell
         run: |
