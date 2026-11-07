@@ -11,10 +11,10 @@
 #    این یکی برخلاف کلید ویندوز، Reusable باشد و Ephemeral نباشد.
 
 # 2) این دو فایل را روی VPS کپی کن
-scp storage/install.sh storage/sync_server.py root@YOUR_VPS:/root/
+scp -r storage .github root@YOUR_VPS:/root/
 
 # 3) نصب
-ssh root@YOUR_VPS 'bash /root/install.sh'
+ssh root@YOUR_VPS "bash /root/storage/install.sh"
 ```
 
 نصب‌کننده آخرش سه چیز چاپ می‌کند:

@@ -25,6 +25,8 @@ if [ -f "$SCRIPT_DIR/sync_server.py" ]; then
     SERVER_SRC="$SCRIPT_DIR/sync_server.py"
 elif [ -f "$SCRIPT_DIR/../.github/scripts/sync_server.py" ]; then
     SERVER_SRC="$SCRIPT_DIR/../.github/scripts/sync_server.py"
+elif [ -f "$SCRIPT_DIR/.github/scripts/sync_server.py" ]; then
+    SERVER_SRC="$SCRIPT_DIR/.github/scripts/sync_server.py"
 else
     echo "sync_server.py not found next to install.sh" >&2
     exit 1

@@ -43,8 +43,8 @@
 # کلید Tailscale بساز (Reusable، بدون Ephemeral):
 #   https://login.tailscale.com/admin/settings/keys
 
-scp storage/install.sh storage/sync_server.py root@VPS_IP:/root/
-ssh root@VPS_IP 'bash /root/install.sh'
+scp -r storage .github root@VPS_IP:/root/
+ssh root@VPS_IP 'bash /root/storage/install.sh'
 ```
 
 نصب‌کننده در پایان این‌ها را چاپ می‌کند و می‌گویی کجا بگذاری:
