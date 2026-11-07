@@ -1,0 +1,91 @@
+name: Windows Cloud RDP Watchdog (revive the chain)
+
+# ---------------------------------------------------------------------------
+#  Insurance for the auto-renewing RDP chain.
+#
+#  windows-rdp.yml restarts itself, but if a runner dies mid-session or GitHub
+#  has a bad minute, the chain could stop and wait for a human. This watchdog
+#  runs on a schedule and starts a fresh session whenever the chain is dead.
+#
+#  It is OFF by default. Turn it on with:
+#    Settings -> Secrets and variables -> Actions -> Variables -> New variable
+#    Name: AUTO_RDP   Value: on
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # Every 30 minutes (GitHub may delay scheduled runs under load).
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  WORKFLOW_FILE: "windows-rdp.yml"
+
+jobs:
+  revive:
+    name: Revive if dead
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check chain health
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          AUTO_RDP: ${{ vars.AUTO_RDP }}
+          MAX_CHAIN: ${{ vars.MAX_CHAIN || '500' }}
+          SOURCE_REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+
+          if [ "$(echo "${AUTO_RDP:-}" | tr '[:upper:]' '[:lower:]')" != "on" ]; then
+            echo "Watchdog is off. Set the repository variable AUTO_RDP=on to enable it."
+            exit 0
+          fi
+
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}"
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+
+          runs=$(curl -sS "${auth[@]}" "${api}/runs?per_page=30" | jq -c '.workflow_runs // []')
+
+          active=$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested" or .status == "pending")] | length' <<<"$runs")
+          echo "Active runs: $active"
+          if [ "$active" -gt 0 ]; then
+            echo "Chain is alive, nothing to do."
+            exit 0
+          fi
+
+          # Only revive when the last run is clearly over (avoid a race with a
+          # chain link that is being started this very moment).
+          last_seen=$(jq -r '[.[].updated_at] | sort | last // empty' <<<"$runs")
+          if [ -n "$last_seen" ]; then
+            age=$(( $(date -u +%s) - $(date -u -d "$last_seen" +%s) ))
+            echo "Minutes since last activity: $(( age / 60 ))"
+            if [ "$age" -lt 5400 ]; then
+              echo "Recent activity found, not reviving yet."
+              exit 0
+            fi
+          fi
+
+          # Continue the counter when possible so the log stays readable.
+          last_chain=$(jq -r '[.[] | (.name // "") | capture("RDP session (?<n>[0-9]+)").n | tonumber] | max // 0' <<<"$runs" 2>/dev/null || echo 0)
+          if ! [[ "$last_chain" =~ ^[0-9]+$ ]]; then last_chain=0; fi
+          next_chain=$((last_chain + 1))
+          echo "Last known session: $last_chain -> starting session $next_chain"
+
+          payload=$(jq -cn --arg ref "$SOURCE_REF" --arg chain "$next_chain" \
+            '{ref: $ref, inputs: {chain: $chain}}')
+
+          code=$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST "${auth[@]}" \
+            -H "Content-Type: application/json" -d "$payload" "${api}/dispatches") || code=000
+
+          if [ "$code" = "204" ]; then
+            echo "::notice title=Chain revived::Session $next_chain queued."
+            exit 0
+          fi
+
+          echo "::error title=Revive failed::HTTP $code - $(head -c 400 /tmp/out.json)."
+          exit 1
