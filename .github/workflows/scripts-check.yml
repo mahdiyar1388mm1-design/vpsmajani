@@ -1,0 +1,53 @@
+name: Check PowerShell scripts
+
+# Syntax-checks every .ps1 in the repo on a real Windows runner, so a typo
+# can never take down the RDP chain silently.
+
+on:
+  push:
+    paths:
+      - ".github/scripts/**.ps1"
+      - ".github/workflows/scripts-check.yml"
+  pull_request:
+    paths:
+      - ".github/scripts/**.ps1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    name: Parse .ps1 files
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse every PowerShell script
+        shell: powershell
+        run: |
+          $files = Get-ChildItem -Path '.github/scripts' -Filter '*.ps1' -Recurse
+          if (-not $files) { Write-Host '::error::No .ps1 files found'; exit 1 }
+
+          $failed = $false
+          foreach ($f in $files) {
+            $errors = $null
+            $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $f.FullName, [ref]$tokens, [ref]$errors)
+
+            if ($errors -and $errors.Count -gt 0) {
+              $failed = $true
+              foreach ($e in $errors) {
+                Write-Host ("::error file={0},line={1},col={2}::{3}" -f `
+                  $f.FullName.Replace('\', '/'), $e.Extent.StartLineNumber, `
+                  $e.Extent.StartColumnNumber, $e.Message)
+              }
+            } else {
+              Write-Host "OK  $($f.Name)  ($($tokens.Count) tokens)"
+            }
+          }
+
+          if ($failed) { exit 1 }
+          Write-Host 'All scripts parse cleanly.'
