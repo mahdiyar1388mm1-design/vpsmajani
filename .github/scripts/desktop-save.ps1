@@ -20,6 +20,7 @@ function Say([string]$m) { if (-not $Quiet) { Write-Host $m } }
 
 $mode       = Get-SyncMode
 $archive    = $null
+$format     = $null
 $markerFile = $null
 Initialize-SyncWorkDir
 $work  = Get-SyncWorkDir
@@ -107,8 +108,10 @@ if ($ok -and (Test-Path $tarPath) -and (Get-Item $tarPath).Length -gt 1024) {
         Remove-Item -Force $tarPath -ErrorAction SilentlyContinue
         $archive = $gzPath
     } else {
-        $usedTar = End-TarFallback -TarPath $tarPath
-        $archive = $usedTar
+        # Never send an uncompressed tar: keep it local-only instead.
+        Say '[save] gzip failed, keeping a local .tar only'
+        $archive = $tarPath
+        $format  = 'tar'
     }
 }
 
@@ -130,9 +133,11 @@ if (-not $archive) {
     exit 0
 }
 
-$size   = (Get-Item $archive).Length
-$secs   = [int]((Get-Date) - $started).TotalSeconds
-$format = if ($archive -like '*.7z') { '7z' } else { 'tar.gz' }
+$size = (Get-Item $archive).Length
+$secs = [int]((Get-Date) - $started).TotalSeconds
+if (-not $format) {
+    $format = if ($archive -like '*.7z') { '7z' } else { 'tar.gz' }
+}
 $sha    = (Get-FileHash -Path $archive -Algorithm SHA256).Hash
 
 Say ("[save] archive: {0} ({1}, {2}) in {3}s" -f (Split-Path $archive -Leaf), (Format-Bytes $size), $format, $secs)
@@ -185,15 +190,3 @@ if ($sent) {
 }
 
 exit 0
-
-# --- helpers ----------------------------------------------------------------
-function End-TarFallback {
-    param([string]$TarPath)
-    # Keep the plain tar only if nothing else worked; the server would refuse
-    # it, so it stays local.
-    if (Test-Path $TarPath) {
-        Say '[save] gzip failed, keeping a local .tar only'
-        return $TarPath
-    }
-    return $null
-}

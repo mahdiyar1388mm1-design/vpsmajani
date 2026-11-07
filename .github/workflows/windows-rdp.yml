@@ -49,14 +49,13 @@ env:
   WORKFLOW_FILE: "windows-rdp.yml"
   RDP_USERNAME: "NvDAdmin"
   TAILSCALE_HOSTNAME: "github-rdp-server"
-  # How long each session holds the machine (the job timeout is 55 min).
-  SESSION_KEEPALIVE_MINUTES: "40"
+  # How long each session holds the machine. The job timeout is 55 min:
+  # ~6 min setup + 30 min session + ~3 min periodic saves + 12 min final save.
+  SESSION_KEEPALIVE_MINUTES: "30"
   # 0 = unlimited (the default): the chain keeps re-spawning forever.
   # Set the repository variable MAX_CHAIN to a number if you ever want it
   # to stop itself after that many sessions (~45 min each).
   MAX_CHAIN: ${{ vars.MAX_CHAIN || '0' }}
-  # Give the final snapshot this many seconds before the job is killed.
-  SYNC_BUDGET_SECONDS: "420"
 
 # Use "vars" instead of "vars" so actionlint and GitHub agree: values come
 # from Settings -> Secrets and variables -> Actions -> Variables.
@@ -115,7 +114,10 @@ jobs:
       SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
       # http  -> snapshots go to STORAGE_URL on the storage VPS (real persistence)
       # local -> snapshots stay on the machine that is about to die (no restore)
-      SYNC_MODE: ${{ vars.SYNC_MODE || 'http' }}
+      # The default is derived from whether a storage URL exists, so the
+      # workflow does the right thing before the VPS is set up (no broken
+      # uploads every 10 minutes).
+      SYNC_MODE: ${{ vars.SYNC_MODE || (vars.STORAGE_URL != '' && 'http' || 'local') }}
       # Where the storage VPS listens: its Tailscale IP or MagicDNS name.
       STORAGE_URL: ${{ vars.STORAGE_URL }}
     steps:
@@ -163,12 +165,6 @@ jobs:
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $user -ErrorAction SilentlyContinue
           Write-Host "Account '$user' is ready."
 
-      - name: 2b. Bring back the files from the previous session
-        shell: powershell
-        run: |
-          .\scripts\desktop-restore.ps1
-          Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
-
       - name: 3. Connect Tailscale (install if missing)
         shell: powershell
         env:
@@ -206,10 +202,18 @@ jobs:
           Write-Host "  A new machine is created automatically when this one expires." -ForegroundColor Green
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 3b. Explain state on the desktop
+      - name: 3b. Bring back the files from the previous session
+        # Needs Tailscale to be up: the storage VPS lives in the tailnet.
+        shell: powershell
+        timeout-minutes: 6
+        run: |
+          .github\scripts\desktop-restore.ps1
+          Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
+
+      - name: 3c. Explain state on the desktop
         shell: powershell
         run: |
-          .\scripts\desktop-info.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
+          .github\scripts\desktop-info.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
             -TailscaleIP ((& 'C:\Program Files\Tailscale\tailscale.exe' ip -4 2>$null | Select-Object -First 1))
 
       - name: 4. Keep the session alive until the next one takes over
@@ -243,7 +247,7 @@ jobs:
               $savedCount++
               Write-Host "[keep-alive] periodic snapshot #$savedCount"
               try {
-                & .\scripts\desktop-save.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
+                & .github\scripts\desktop-save.ps1 -SessionNumber ${{ needs.init.outputs.chain }} `
                   -StorageUrl $env:STORAGE_URL -Token $env:SYNC_TOKEN
               } catch {
                 Write-Host "[keep-alive] snapshot failed: $_"
@@ -271,7 +275,7 @@ jobs:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           Write-Host "Final snapshot (this timeout cannot eat the job)."
-          .\scripts\desktop-save.ps1 -SessionNumber ${{ needs.init.outputs.chain }}
+          .github\scripts\desktop-save.ps1 -SessionNumber ${{ needs.init.outputs.chain }}
           Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue
 
   # -------------------------------------------------------------------------
