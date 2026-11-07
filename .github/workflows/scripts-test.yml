@@ -110,6 +110,9 @@ jobs:
           assert meta['bytes'] > 100_000, meta
           assert meta['format'] == 'tar.gz', meta
           assert len(meta['sha256']) == 64, meta
+          assert meta['origin']['session'] == '1', meta
+          assert meta['origin']['format'] == 'tar.gz', meta
+          print('origin marker ok:', meta['origin']['host'])
           print('meta looks right:', meta['bytes'], 'bytes,', meta['format'])
           PY
 

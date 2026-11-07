@@ -82,6 +82,41 @@ function Invoke-SevenZip {
     return ($LASTEXITCODE -eq 0)
 }
 
+function Test-GzipFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $fs = [IO.File]::OpenRead($Path)
+        try { return ($fs.ReadByte() -eq 0x1f -and $fs.ReadByte() -eq 0x8b) }
+        finally { $fs.Close() }
+    } catch {
+        return $false
+    }
+}
+
+# Compress a file to .gz using .NET only (no external tools, no modules).
+function Compress-GzipFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    try {
+        $in  = [IO.File]::OpenRead($Path)
+        $out = [IO.File]::Create($Destination)
+        try {
+            $gz = New-Object System.IO.Compression.GZipStream(
+                $out, [System.IO.Compression.CompressionLevel]::Fastest, $true)
+            try { $in.CopyTo($gz, 262144) } finally { $gz.Dispose() }
+        } finally {
+            $in.Dispose()
+            $out.Dispose()
+        }
+        return $true
+    } catch {
+        Write-Host "   gzip failed: $_"
+        return $false
+    }
+}
+
 # Extract an archive relative to C:\ so absolute paths land back in place.
 function Invoke-TarExtract {
     param([Parameter(Mandatory = $true)][string]$Archive)

@@ -9,6 +9,7 @@ Endpoints
   GET  /health         -> {"ok": true, ...}
   GET  /meta           -> info about the current snapshot
   GET  /stats          -> sizes of every retained snapshot
+  GET  /marker         -> the small last-save.txt sent with the snapshot
   GET  /snapshot       -> the current snapshot (tar.gz)
   PUT  /snapshot       -> upload a new snapshot (rotates the old ones)
                           headers: X-Snapshot-Format, X-Snapshot-Sha256,
@@ -40,6 +41,28 @@ META = os.path.join(SNAP_DIR, "meta.json")
 
 def snap_path(n):
     return os.path.join(SNAP_DIR, f"{SNAP_PREFIX}-{n}.tar.gz")
+
+
+def detect_format(path):
+    """Sniff what the client actually sent, so a mislabelled file cannot
+    poison the volume. Returns a format name or None if unrecognised."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+            fh.seek(257)
+            tar_magic = fh.read(5)
+    except OSError:
+        return None
+
+    if head[:2] == b"\x1f\x8b":
+        return "tar.gz"
+    if head[:6] == b"7z\xbc\xaf'\x1c":
+        return "7z"
+    if head[:4] == b"PK\x03\x04":
+        return "zip"
+    if tar_magic == b"ustar":
+        return "tar"
+    return None
 
 
 def read_meta():
@@ -121,6 +144,13 @@ class Handler(BaseHTTPRequestHandler):
                     out[os.path.basename(p)] = {"bytes": size, "mtime": int(os.path.getmtime(p))}
             return self._json(200, {"snapshots": out, "total_bytes": total})
 
+        if path == "/marker":
+            marker = os.path.join(SNAP_DIR, "last-save.txt")
+            if not os.path.exists(marker):
+                return self._json(404, {"error": "no marker yet"})
+            with open(marker, "r", encoding="utf-8", errors="replace") as fh:
+                return self._send(200, fh.read(), "text/plain; charset=utf-8")
+
         if path == "/snapshot":
             n = newest_index()
             if n is None:
@@ -153,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         if not self._authorized():
             return self._json(401, {"error": "unauthorized"})
+        if self.path.split("?")[0] == "/marker":
+            return self._put_marker()
         if self.path.split("?")[0] != "/snapshot":
             return self._json(404, {"error": "not found"})
 
@@ -187,14 +219,12 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return self._json(400, {"error": "incomplete upload"})
 
-        # Quick sanity check: a gzip file starts with 1f 8b.
-        with open(incoming, "rb") as fh:
-            magic = fh.read(2)
-        if magic != b"\x1f\x8b":
+        # Only store something we can recognise (and therefore restore).
+        detected = detect_format(incoming)
+        if not detected:
             os.unlink(incoming)
-            return self._json(415, {"error": "body is not gzip"})
-
-        format_name = self.headers.get("X-Snapshot-Format", "tar.gz").strip() or "tar.gz"
+            return self._json(415, {"error": "unrecognised archive format"})
+        format_name = detected
 
         # Rotate: snapshot-N -> snapshot-(N+1), newest first.
         rotating = [n for n in range(SNAP_KEEP) if os.path.exists(snap_path(n))]
@@ -202,6 +232,18 @@ class Handler(BaseHTTPRequestHandler):
             if n + 1 < SNAP_KEEP:
                 os.replace(snap_path(n), snap_path(n + 1))
         os.replace(incoming, snap_path(0))
+
+        marker = os.path.join(SNAP_DIR, "last-save.txt")
+        origin = {}
+        if os.path.exists(marker):
+            try:
+                with open(marker, "r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if "=" in line:
+                            k, v = line.strip().split("=", 1)
+                            origin[k] = v
+            except OSError:
+                pass
 
         meta = {
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -211,9 +253,24 @@ class Handler(BaseHTTPRequestHandler):
             "format": format_name,
             "sha256": self.headers.get("X-Snapshot-Sha256", ""),
             "sha_algorithm": self.headers.get("X-Snapshot-Sha-Algorithm", "sha256"),
+            "origin": origin,
         }
         write_meta(meta)
         return self._json(201, {"ok": True, **meta})
+
+    def _put_marker(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return self._json(400, {"error": "bad Content-Length"})
+        if not 0 < length <= 64 * 1024:
+            return self._json(400, {"error": "marker too big or empty"})
+
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        body = self.rfile.read(length)
+        with open(os.path.join(SNAP_DIR, "last-save.txt"), "wb") as fh:
+            fh.write(body)
+        return self._json(201, {"ok": True, "bytes": len(body)})
 
     def do_DELETE(self):
         if not self._authorized():
