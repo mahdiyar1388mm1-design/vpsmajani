@@ -165,14 +165,33 @@ jobs:
 
       - name: Corrupt upload is rejected and previous snapshot survives
         shell: bash
+        env:
+          URL: http://127.0.0.1:8787
         run: |
+          set -uo pipefail
+          fail() { echo "::error title=CORRUPT-UPLOAD CHECK FAILED::$*"; exit 1; }
+
           code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
-            -H 'Authorization: Bearer testtoken' --data-binary 'not a gzip' \
-            http://127.0.0.1:8787/snapshot)
-          echo "corrupt upload -> HTTP $code"; test "$code" = "415"
-          # newest snapshot still downloadable and still the good one
-          curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/snapshot -o "$RUNNER_TEMP/again.tar.gz"
-          tar -tzf "$RUNNER_TEMP/again.tar.gz" | head -5
+            -H 'Authorization: Bearer testtoken' --data-binary 'not an archive' \
+            "$URL/snapshot") || code=000
+          echo "corrupt upload -> HTTP $code (want 415)"
+          [ "$code" = "415" ] || fail "server answered $code, expected 415"
+
+          # The good snapshot must still be the newest one.
+          curl -s -H 'Authorization: Bearer testtoken' "$URL/snapshot" -o "$RUNNER_TEMP/again.tar.gz" \
+            || fail "could not download the newest snapshot"
+          ls -l "$RUNNER_TEMP/again.tar.gz"
+          file "$RUNNER_TEMP/again.tar.gz" || true
+          tar -tzf "$RUNNER_TEMP/again.tar.gz" | head -5 || fail "newest snapshot is not a readable tar.gz"
+          tar -xzOf "$RUNNER_TEMP/again.tar.gz" 'Users/SyncTestUser/Desktop/notes.txt' \
+            | grep -q 'my notes' || fail "restored archive lost notes.txt"
+
+          # And a replay of the corrupt upload must not have rotated it away.
+          meta=$(curl -s -H 'Authorization: Bearer testtoken' "$URL/meta")
+          echo "meta after corrupt upload: $meta"
+          echo "$meta" | grep -q '"format": "tar.gz"' || fail "meta no longer describes a tar.gz snapshot"
+
+          echo "corrupt upload ignored, good snapshot intact"
 
       - name: Report outcome
         if: always()
