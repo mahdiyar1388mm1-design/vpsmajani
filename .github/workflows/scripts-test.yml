@@ -182,7 +182,15 @@ jobs:
             || fail "could not download the newest snapshot"
           ls -l "$RUNNER_TEMP/again.tar.gz"
           file "$RUNNER_TEMP/again.tar.gz" || true
-          tar -tzf "$RUNNER_TEMP/again.tar.gz" | head -5 || fail "newest snapshot is not a readable tar.gz"
+          if ! tar -tzf "$RUNNER_TEMP/again.tar.gz" > "$RUNNER_TEMP/list.txt" 2> "$RUNNER_TEMP/tarerr.txt"; then
+            echo "::error title=TAR LIST FAILED::$(head -c 300 "$RUNNER_TEMP/tarerr.txt")"
+            echo "size=$(stat -c%s "$RUNNER_TEMP/again.tar.gz") bytes"
+            head -c 16 "$RUNNER_TEMP/again.tar.gz" | od -An -tx1
+            curl -s -H 'Authorization: Bearer testtoken' "$URL/meta"
+            curl -s -H 'Authorization: Bearer testtoken' "$URL/stats"
+            exit 1
+          fi
+          head -5 "$RUNNER_TEMP/list.txt"
           tar -xzOf "$RUNNER_TEMP/again.tar.gz" 'Users/SyncTestUser/Desktop/notes.txt' \
             | grep -q 'my notes' || fail "restored archive lost notes.txt"
 
