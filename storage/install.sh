@@ -19,6 +19,16 @@ SNAP_KEEP="${SNAP_KEEP:-3}"
 PORT="${PORT:-8787}"
 SERVICE=/etc/systemd/system/vpsmajani-sync.service
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The server lives in .github/scripts when run from a repo checkout,
+# and next to this script when the two files are copied over on their own.
+if [ -f "$SCRIPT_DIR/sync_server.py" ]; then
+    SERVER_SRC="$SCRIPT_DIR/sync_server.py"
+elif [ -f "$SCRIPT_DIR/../.github/scripts/sync_server.py" ]; then
+    SERVER_SRC="$SCRIPT_DIR/../.github/scripts/sync_server.py"
+else
+    echo "sync_server.py not found next to install.sh" >&2
+    exit 1
+fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -78,7 +88,7 @@ else
 fi
 
 # ------------------------------------------------------------------- install
-install -m 0755 "$SCRIPT_DIR/sync_server.py" /usr/local/bin/vpsmajani-sync.py
+install -m 0755 "$SERVER_SRC" /usr/local/bin/vpsmajani-sync.py
 install -d -m 0700 /etc/vpsmajani-sync
 
 cat > /etc/vpsmajani-sync/env <<EOF
