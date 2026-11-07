@@ -101,21 +101,29 @@ jobs:
       - name: Server has the snapshot
         shell: bash
         run: |
-          echo "--- meta ---"
-          curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/meta | tee "$RUNNER_TEMP/meta.json"
-          echo
-          python - <<'PY'
-          import json, os
-          meta = json.load(open(os.environ['RUNNER_TEMP'] + '/meta.json'))
-          assert meta['bytes'] > 100_000, meta
-          assert meta['format'] == 'tar.gz', meta
-          assert len(meta['sha256']) == 64, meta
-          assert meta['origin']['session'] == '1', meta
-          assert meta['origin']['format'] == 'tar.gz', meta
-          print('origin marker ok:', meta['origin']['host'])
-          print('meta looks right:', meta['bytes'], 'bytes,', meta['format'])
+          set -x
+          curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/meta -o "$RUNNER_TEMP/meta.json"
+          echo "--- meta.json ---"
+          cat "$RUNNER_TEMP/meta.json"; echo
+          python - <<'PY' || { echo "::error title=META CHECK FAILED::see meta.json above"; exit 1; }
+          import json, os, sys
+          raw = open(os.environ['RUNNER_TEMP'] + '/meta.json').read()
+          try:
+              meta = json.loads(raw)
+          except Exception as e:
+              print('::error title=META IS NOT JSON::' + raw[:400])
+              sys.exit(1)
+          problems = []
+          if meta.get('bytes', 0) <= 100_000: problems.append('bytes too small: %s' % meta.get('bytes'))
+          if meta.get('format') != 'tar.gz': problems.append('format is %r' % meta.get('format'))
+          if len(str(meta.get('sha256', ''))) != 64: problems.append('sha256 is %r' % meta.get('sha256'))
+          origin = meta.get('origin') or {}
+          if origin.get('session') != '1': problems.append('origin.session is %r' % origin.get('session'))
+          if problems:
+              print('::error title=META CHECK FAILED::' + '; '.join(problems))
+              sys.exit(1)
+          print('meta ok, origin host:', origin.get('host'))
           PY
-
       - name: Restore into a different profile
         shell: powershell
         env:
