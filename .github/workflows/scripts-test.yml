@@ -58,25 +58,27 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "cwd=$(Get-Location)  ps=$($PSVersionTable.PSVersion)"
-          $fakeUser = 'SyncTestUser'
-          $p = "C:\Users\$fakeUser"
-          Write-Host "seeding into $p"
-          New-Item -ItemType Directory -Force -Path "$p\Desktop\project" | Out-Null
-          Set-Content "$p\Desktop\notes.txt"        'my notes from session 1' -Encoding UTF8
-          Set-Content "$p\Desktop\project\app.ps1"  'Write-Host "kept"' -Encoding UTF8
-          Set-Content "$p\Documents\todo.md"        "- buy vps`n- never lose files" -Encoding UTF8
-          New-Item -ItemType Directory -Force -Path "$p\Documents" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$p\Downloads" | Out-Null
-          # 3 MB of pseudo-random data to make the transfer non-trivial
-          $bytes = New-Object byte[] (3MB)
-          $rng = New-Object System.Random 42
-          $rng.NextBytes($bytes)
-          [IO.File]::WriteAllBytes("$p\Downloads\blob.bin", $bytes)
-          # a cache folder that MUST be excluded
-          New-Item -ItemType Directory -Force -Path "$p\AppData\Local\Temp" | Out-Null
-          Set-Content "$p\AppData\Local\Temp\junk.tmp" 'should not be saved'
-          Write-Host "seeded $p"
+          try {
+            $fakeUser = 'SyncTestUser'
+            $p = "C:\Users\$fakeUser"
+            Write-Host "seeding into $p"
+            New-Item -ItemType Directory -Force -Path "$p\Desktop\project" | Out-Null
+            Set-Content "$p\Desktop\notes.txt"        'my notes from session 1' -Encoding UTF8
+            Set-Content "$p\Desktop\project\app.ps1"  'Write-Host "kept"' -Encoding UTF8
+            New-Item -ItemType Directory -Force -Path "$p\Documents" | Out-Null
+            Set-Content "$p\Documents\todo.md"        "- buy vps`n- never lose files" -Encoding UTF8
+            New-Item -ItemType Directory -Force -Path "$p\Downloads" | Out-Null
+            $bytes = New-Object byte[] (3MB)
+            $rng = New-Object System.Random 42
+            $rng.NextBytes($bytes)
+            [IO.File]::WriteAllBytes("$p\Downloads\blob.bin", $bytes)
+            New-Item -ItemType Directory -Force -Path "$p\AppData\Local\Temp" | Out-Null
+            Set-Content "$p\AppData\Local\Temp\junk.tmp" 'should not be saved'
+            Write-Host "seeded $p"
+          } catch {
+            Write-Host "::error::SEED FAILED: $($_.Exception.Message) [$(($_.InvocationInfo.PositionMessage -split "`n")[1].Trim())]"
+            exit 1
+          }
 
       - name: Save (upload snapshot)
         shell: powershell
@@ -86,8 +88,14 @@ jobs:
           STORAGE_URL: http://127.0.0.1:8787
           SYNC_TOKEN: testtoken
         run: |
-          .\.github\scripts\desktop-save.ps1 -SessionNumber 1
-          if ($LASTEXITCODE -ne 0) { throw "save script exited $LASTEXITCODE" }
+          try {
+            .\.github\scripts\desktop-save.ps1 -SessionNumber 1
+            if ($LASTEXITCODE -ne 0) { throw "save script exited $LASTEXITCODE" }
+          } catch {
+            Write-Host "::error::SAVE FAILED: $($_.Exception.Message)"
+            Get-Content C:\vpsmajani-sync\state\status.txt -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "status: $_" }
+            exit 1
+          }
           Write-Host '--- status ---'; Get-Content C:\vpsmajani-sync\state\status.txt
 
       - name: Server has the snapshot
