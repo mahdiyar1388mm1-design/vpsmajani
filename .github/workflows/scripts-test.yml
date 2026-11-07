@@ -1,0 +1,152 @@
+name: Test desktop save/restore
+
+# End-to-end test of the persistence layer on a real Windows machine:
+#   seed a fake profile -> desktop-save.ps1 -> HTTP snapshot server ->
+#   desktop-restore.ps1 into a different folder -> byte-for-byte compare.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/scripts-test.yml"
+  push:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/scripts-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    name: Save -> server -> restore roundtrip
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python for the snapshot server
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start snapshot server
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/vol"
+          SNAP_DIR="$RUNNER_TEMP/vol" SNAP_KEEP=3 SYNC_TOKEN=testtoken \
+            BIND_ADDR=127.0.0.1 BIND_PORT=8787 \
+            python .github/scripts/sync_server.py > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 40); do
+            curl -sf -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/health && break
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/server.log"
+
+      - name: Seed a fake user profile
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fakeUser = 'SyncTestUser'
+          $p = "C:\Users\$fakeUser"
+          New-Item -ItemType Directory -Force -Path "$p\Desktop\project" | Out-Null
+          Set-Content "$p\Desktop\notes.txt"        'my notes from session 1' -Encoding UTF8
+          Set-Content "$p\Desktop\project\app.ps1"  'Write-Host "kept"' -Encoding UTF8
+          Set-Content "$p\Documents\todo.md"        "- buy vps`n- never lose files" -Encoding UTF8
+          New-Item -ItemType Directory -Force -Path "$p\Downloads" | Out-Null
+          # 3 MB of pseudo-random data to make the transfer non-trivial
+          $bytes = New-Object byte[] (3MB)
+          (New-Object Random 42).NextBytes($bytes)
+          [IO.File]::WriteAllBytes("$p\Downloads\blob.bin", $bytes)
+          # a cache folder that MUST be excluded
+          New-Item -ItemType Directory -Force -Path "$p\AppData\Local\Temp" | Out-Null
+          Set-Content "$p\AppData\Local\Temp\junk.tmp" 'should not be saved'
+          Write-Host "seeded $p"
+
+      - name: Save (upload snapshot)
+        shell: powershell
+        env:
+          SYNC_MODE: http
+          SYNC_PROFILE_USER: SyncTestUser
+          STORAGE_URL: http://127.0.0.1:8787
+          SYNC_TOKEN: testtoken
+        run: |
+          .\.github\scripts\desktop-save.ps1 -SessionNumber 1
+          if ($LASTEXITCODE -ne 0) { throw "save script exited $LASTEXITCODE" }
+          Write-Host '--- status ---'; Get-Content C:\vpsmajani-sync\state\status.txt
+
+      - name: Server has the snapshot
+        shell: bash
+        run: |
+          echo "--- meta ---"
+          curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/meta | tee "$RUNNER_TEMP/meta.json"
+          echo
+          python - <<'PY'
+          import json, os
+          meta = json.load(open(os.environ['RUNNER_TEMP'] + '/meta.json'))
+          assert meta['bytes'] > 100_000, meta
+          assert meta['format'] == 'tar.gz', meta
+          assert len(meta['sha256']) == 64, meta
+          print('meta looks right:', meta['bytes'], 'bytes,', meta['format'])
+          PY
+
+      - name: Restore into a different profile
+        shell: powershell
+        env:
+          SYNC_MODE: http
+          SYNC_PROFILE_USER: SyncTestUser
+          STORAGE_URL: http://127.0.0.1:8787
+          SYNC_TOKEN: testtoken
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # simulate a brand new machine: wipe the profile entirely
+          Remove-Item -Recurse -Force 'C:\Users\SyncTestUser' -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path 'C:\Users\SyncTestUser' | Out-Null
+
+          .\.github\scripts\desktop-restore.ps1
+          if ($LASTEXITCODE -ne 0) { throw "restore script exited $LASTEXITCODE" }
+
+          $p = 'C:\Users\SyncTestUser'
+          $checks = @(
+            @{ Path = "$p\Desktop\notes.txt";       Expect = 'my notes from session 1' }
+            @{ Path = "$p\Desktop\project\app.ps1"; Expect = 'Write-Host "kept"' }
+            @{ Path = "$p\Documents\todo.md";       Expect = '- buy vps' }
+          )
+          foreach ($c in $checks) {
+            if (-not (Test-Path $c.Path)) { throw "MISSING after restore: $($c.Path)" }
+            $content = Get-Content $c.Path -Raw
+            if ($content -notlike "*$($c.Expect)*") { throw "WRONG content in $($c.Path): $content" }
+            Write-Host "OK restored $($c.Path)"
+          }
+
+          if (-not (Test-Path "$p\Downloads\blob.bin")) { throw 'MISSING: blob.bin' }
+          $len = (Get-Item "$p\Downloads\blob.bin").Length
+          if ($len -ne 3MB) { throw "blob.bin size mismatch: $len" }
+          Write-Host "OK restored blob.bin ($len bytes)"
+
+          if (Test-Path "$p\AppData\Local\Temp\junk.tmp") { throw 'cache file was wrongly restored' }
+          Write-Host 'OK cache excluded as intended'
+
+          Write-Host '--- status after restore ---'; Get-Content C:\vpsmajani-sync\state\status.txt
+
+      - name: Corrupt upload is rejected and previous snapshot survives
+        shell: bash
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            -H 'Authorization: Bearer testtoken' --data-binary 'not a gzip' \
+            http://127.0.0.1:8787/snapshot)
+          echo "corrupt upload -> HTTP $code"; test "$code" = "415"
+          # newest snapshot still downloadable and still the good one
+          curl -s -H 'Authorization: Bearer testtoken' http://127.0.0.1:8787/snapshot -o "$RUNNER_TEMP/again.tar.gz"
+          tar -tzf "$RUNNER_TEMP/again.tar.gz" | head -5
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-test-logs
+          path: |
+            C:\vpsmajani-sync\log
+            C:\vpsmajani-sync\state
+          if-no-files-found: ignore

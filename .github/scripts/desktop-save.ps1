@@ -22,15 +22,18 @@ $mode = Get-SyncMode
 Initialize-SyncWorkDir
 $work  = Get-SyncWorkDir
 $state = Join-Path $work 'state'
-$log   = Join-Path $work 'log\save.log'
 
 Say "[save] mode=$mode session=$SessionNumber"
 
-$paths = Get-PreservedPaths
-$missing = @($paths | Where-Object { -not (Test-Path $_) })
-if ($missing.Count -eq $paths.Count) {
-    Write-Host '::warning title=Nothing to save::The profile folder does not exist yet, nothing to snapshot.'
+$profilePath = Get-ProfilePath
+if (-not (Test-Path $profilePath)) {
+    Write-Host "::warning title=Nothing to save::The profile folder $profilePath does not exist yet, nothing to snapshot."
     exit 0
+}
+
+function Set-Status([string]$text) {
+    $text | Set-Content -Path (Join-Path $state 'status.txt') -Encoding UTF8
+    Say "[save] $text"
 }
 
 # --- disk space guard -------------------------------------------------------
@@ -38,52 +41,64 @@ $free = (Get-PSDrive C).Free
 Say ("[save] free disk: {0}" -f (Format-Bytes $free))
 if ($free -lt 1GB) {
     Write-Host '::warning title=Snapshot skipped::Less than 1 GB free on C:, not enough room to build the archive.'
+    Set-Status 'Snapshot skipped: not enough free disk space.'
     exit 0
 }
 
 # --- build the archive ------------------------------------------------------
 $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
 $archive = Join-Path $work "snapshot-$stamp.tar.gz"
-$tmpDir  = Join-Path $work 'data'
-Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+Remove-Item -Force $archive -ErrorAction SilentlyContinue
 
-# What we *intend* to keep, for the archive map files.
-$paths | Set-Content -Path (Join-Path $tmpDir 'paths.txt') -Encoding UTF8
-
-Say '[save] collecting files...'
+$tarExe = Get-TarExe
 $started = Get-Date
-$ok = Invoke-SevenZip -Arguments @(
-    'a', '-ttar', '-so', $archive,
-    '--', ($paths | ForEach-Object { "$($_)" })
-)
+$ok = $false
+
+if ($tarExe) {
+    Say "[save] collecting files with $tarExe ..."
+    $args = @('-cf', $archive, '-C', 'C:\')
+
+    # Keep the archive honest: one file describing what is inside.
+    $manifest = Join-Path $work 'tmp\preserved-paths.txt'
+    (Get-PreservedPaths) | Set-Content -Path $manifest -Encoding UTF8
+    $args += @('-C', (Split-Path $manifest -Parent), (Split-Path $manifest -Leaf))
+
+    foreach ($ex in Get-SyncExcludes) { $args += "--exclude=$ex" }
+
+    # Work relative to C:\ so paths in the archive are the real ones.
+    Push-Location 'C:\'
+    try {
+        & $tarExe @args 2>&1 | ForEach-Object { Say "   $_" }
+        $ok = ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1)   # tar exit 1 = some files vanished mid-run
+    } catch {
+        Say "[save] tar error: $_"
+        $ok = $false
+    } finally {
+        Pop-Location
+    }
+}
 
 if (-not $ok -or -not (Test-Path $archive) -or (Get-Item $archive).Length -lt 1024) {
-    Say '[save] 7-Zip unavailable or failed, falling back to Compress-Archive'
-    try {
-        $zip = Join-Path $work "snapshot-$stamp.zip"
-        Compress-Archive -Path ($paths | Where-Object { Test-Path $_ }) -DestinationPath $zip `
-            -CompressionLevel Optimal -Force -ErrorAction Stop
-        $archive = $zip
-    } catch {
-        Write-Host "::warning title=Snapshot failed::Could not create the archive: $($_.Exception.Message)"
-        exit 0
-    }
+    Say '[save] tar failed or produced nothing usable, trying 7-Zip'
+    $fallback = Join-Path $work "snapshot-$stamp.7z"
+    $ok = Invoke-SevenZip -Arguments @(
+        'a', '-t7z', '-mx=1', $fallback, ($profilePath), (Join-Path $work 'tmp\preserved-paths.txt')
+    )
+    if ($ok -and (Test-Path $fallback)) { $archive = $fallback }
+}
+
+if (-not (Test-Path $archive) -or (Get-Item $archive).Length -lt 1024) {
+    Write-Host '::warning title=Snapshot failed::No usable archive could be created.'
+    Set-Status 'Snapshot failed: no usable archive could be created.'
+    exit 0
 }
 
 $size = (Get-Item $archive).Length
 $secs = [int]((Get-Date) - $started).TotalSeconds
 Say ("[save] archive: {0} ({1}) in {2}s" -f (Split-Path $archive -Leaf), (Format-Bytes $size), $secs)
 
-# gzip it (7-Zip wrote a plain tar)
-if ($archive -like '*.tar') {
-    $gz = "$archive.gz"
-    $okGz = Invoke-SevenZip -Arguments @('a', '-tgzip', '-mx=3', $gz, $archive)
-    if ($okGz) { Remove-Item $archive -Force -ErrorAction SilentlyContinue; $archive = $gz }
-    $size = (Get-Item $archive).Length
-}
-
 $sha = (Get-FileHash -Path $archive -Algorithm SHA256).Hash
+$script:ArchiveFormat = if ($archive -like '*.7z') { '7z' } else { 'tar.gz' }
 $meta = @(
     "saved_at=$(Get-Date -Format o)"
     "session=$SessionNumber"
@@ -91,41 +106,41 @@ $meta = @(
     "mode=$mode"
     "bytes=$size"
     "sha256=$sha"
+    "sha_algorithm=sha256"
     "file=$(Split-Path $archive -Leaf)"
+    "format=$([IO.Path]::GetExtension($archive).TrimStart('.'))"
+    "profile=$profilePath"
 )
-$meta | Set-Content -Path (Join-Path $work 'last-save.txt') -Encoding UTF8
+Set-Content -Path (Join-Path $work 'last-save.txt') -Value $meta -Encoding UTF8
 Say "[save] sha256=$sha"
 
 # --- ship it ----------------------------------------------------------------
-function Send-Payload {
-    param([string]$Path)
-
-    if ($mode -ne 'http') { return $false }
+$sent = $false
+if ($mode -eq 'http') {
     if (-not $StorageUrl) {
         Write-Host '::warning title=Snapshot not uploaded::SYNC_MODE=http but STORAGE_URL is empty.'
-        return $false
-    }
+    } else {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $headers = @{
+            'X-Client-Name'           = [string]$env:COMPUTERNAME
+            'X-Session-Number'       = [string]$SessionNumber
+            'X-Snapshot-Format'      = [string]$script:ArchiveFormat
+            'X-Snapshot-Sha256'      = [string]$sha
+            'X-Snapshot-Sha-Algorithm' = 'sha256' 
+        }
+        if ($Token) { $headers['Authorization'] = "Bearer $Token" }
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $headers = @{
-        'X-Client-Name'     = [string]$env:COMPUTERNAME
-        'X-Session-Number'  = [string]$SessionNumber
-    }
-    if ($Token) { $headers['Authorization'] = "Bearer $Token" }
-
-    try {
-        Say "[save] uploading to $StorageUrl/snapshot ..."
-        $r = Invoke-RestMethod -Method Put -Uri "$StorageUrl/snapshot" -Headers $headers `
-            -InFile $Path -ContentType 'application/gzip' -TimeoutSec 900
-        Say "[save] uploaded: $($r | ConvertTo-Json -Compress)"
-        return $true
-    } catch {
-        Write-Host "::warning title=Snapshot not uploaded::Upload failed: $($_.Exception.Message)"
-        return $false
+        try {
+            Say "[save] uploading to $StorageUrl/snapshot ..."
+            $r = Invoke-RestMethod -Method Put -Uri "$StorageUrl/snapshot" -Headers $headers `
+                -InFile $archive -ContentType 'application/gzip' -TimeoutSec 900
+            Say "[save] uploaded: $($r | ConvertTo-Json -Compress)"
+            $sent = $true
+        } catch {
+            Write-Host "::warning title=Snapshot not uploaded::Upload failed: $($_.Exception.Message)"
+        }
     }
 }
-
-$sent = Send-Payload -Path $archive
 
 # Keep the last two archives locally so a same-VM retry has something.
 Get-ChildItem -Path $work -Filter 'snapshot-*' -File |
@@ -133,11 +148,11 @@ Get-ChildItem -Path $work -Filter 'snapshot-*' -File |
     Select-Object -Skip 2 | Remove-Item -Force -ErrorAction SilentlyContinue
 
 if ($sent) {
-    Say '[save] done: desktop is safe on the storage volume.'
+    Set-Status "Snapshot saved to the volume at $(Get-Date -Format 'HH:mm')."
 } elseif ($mode -eq 'local') {
-    Say "[save] done (local mode): archive kept at $archive on this VM only."
+    Set-Status 'Snapshot saved on this VM only (local mode, no storage volume).'
 } else {
-    Say '[save] done, but the upload did not succeed (see warning).'
+    Set-Status 'Snapshot created but the upload did not succeed.'
 }
 
 exit 0

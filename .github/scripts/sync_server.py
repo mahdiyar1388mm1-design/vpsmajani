@@ -11,6 +11,8 @@ Endpoints
   GET  /stats          -> sizes of every retained snapshot
   GET  /snapshot       -> the current snapshot (tar.gz)
   PUT  /snapshot       -> upload a new snapshot (rotates the old ones)
+                          headers: X-Snapshot-Format, X-Snapshot-Sha256,
+                                   X-Snapshot-Sha-Algorithm, X-Session-Number
   GET  /snapshot/<n>   -> snapshot n (0 = newest)
 
 Auth: if SYNC_TOKEN is set, every request must send "Authorization: Bearer <token>".
@@ -26,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SNAP_DIR = os.environ.get("SNAP_DIR", "/mnt/vpsmajani")
 SNAP_KEEP = max(1, int(os.environ.get("SNAP_KEEP", "3")))
+SNAP_ROOT = os.environ.get("SNAP_ROOT", SNAP_DIR)
 SNAP_PREFIX = "snapshot"
 MAX_BYTES = int(os.environ.get("MAX_BYTES", str(4 * 1024**3)))
 TOKEN = os.environ.get("SYNC_TOKEN", "")
@@ -191,6 +194,8 @@ class Handler(BaseHTTPRequestHandler):
             os.unlink(incoming)
             return self._json(415, {"error": "body is not gzip"})
 
+        format_name = self.headers.get("X-Snapshot-Format", "tar.gz").strip() or "tar.gz"
+
         # Rotate: snapshot-N -> snapshot-(N+1), newest first.
         rotating = [n for n in range(SNAP_KEEP) if os.path.exists(snap_path(n))]
         for n in sorted(rotating, reverse=True):
@@ -203,6 +208,9 @@ class Handler(BaseHTTPRequestHandler):
             "bytes": os.path.getsize(snap_path(0)),
             "client": self.headers.get("X-Client-Name", "unknown"),
             "session": self.headers.get("X-Session-Number", "unknown"),
+            "format": format_name,
+            "sha256": self.headers.get("X-Snapshot-Sha256", ""),
+            "sha_algorithm": self.headers.get("X-Snapshot-Sha-Algorithm", "sha256"),
         }
         write_meta(meta)
         return self._json(201, {"ok": True, **meta})

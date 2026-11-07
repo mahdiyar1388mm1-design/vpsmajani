@@ -31,7 +31,7 @@ if ($mode -ne 'http' -or -not $StorageUrl) {
     if ($mode -eq 'http' -and -not $StorageUrl) {
         Write-Host '::warning title=Restore skipped::SYNC_MODE=http but STORAGE_URL is empty.'
     }
-    Set-Status 'No storage volume configured (SYNC_MODE=local). Files from previous sessions are not restored.'
+    Set-Status 'No storage volume configured, so nothing from a previous session can be restored.'
     exit 0
 }
 
@@ -44,73 +44,79 @@ $meta = $null
 try {
     $meta = Invoke-RestMethod -Method Get -Uri "$StorageUrl/meta" -Headers $headers -TimeoutSec 30
 } catch {
-    Set-Status "Storage volume is empty or unreachable ($($_.Exception.Message)). Starting with a clean desktop."
+    Set-Status "The storage volume is empty or unreachable ($($_.Exception.Message)). Starting with a clean desktop."
     exit 0
 }
 
-Say "[restore] snapshot from $($meta.saved_at) ($(Format-Bytes ([double]$meta.bytes)))"
+Say ("[restore] snapshot from {0} ({1})" -f $meta.saved_at, (Format-Bytes ([double]$meta.bytes)))
 
 # --- download ---------------------------------------------------------------
-$incoming = Join-Path $work 'restore.incoming'
-$archive  = Join-Path $work 'restore.tar.gz'
-Remove-Item -Force $incoming, $archive -ErrorAction SilentlyContinue
+$incoming = Join-Path $work 'tmp\restore.incoming'
+Remove-Item -Force $incoming -ErrorAction SilentlyContinue
 
 try {
     Say '[restore] downloading snapshot...'
     Invoke-WebRequest -Method Get -Uri "$StorageUrl/snapshot" -Headers $headers `
         -OutFile $incoming -TimeoutSec 900 -UseBasicParsing
 } catch {
-    Set-Status "Snapshot download failed ($($_.Exception.Message)). Starting with a clean desktop."
+    Set-Status "Downloading the snapshot failed ($($_.Exception.Message)). Starting with a clean desktop."
     exit 0
 }
 
 $size = (Get-Item $incoming).Length
 if ($size -lt 1024) {
-    Set-Status "Downloaded snapshot looks empty ($size bytes). Starting with a clean desktop."
+    Set-Status "The downloaded snapshot looks empty ($size bytes). Starting with a clean desktop."
     exit 0
 }
 Say ("[restore] downloaded {0}" -f (Format-Bytes $size))
 
-if ($meta.sha256) {
-    $actual = (Get-FileHash -Path $incoming -Algorithm SHA256).Hash
-    if ($actual -ne $meta.sha256) {
-        Write-Host "::warning title=Snapshot corrupt::sha256 mismatch ($actual vs $($meta.sha256)), not restoring."
-        Set-Status 'Snapshot was corrupt (sha256 mismatch). Starting with a clean desktop.'
-        exit 0
+if ($meta.sha256 -and $meta.sha_algorithm -and $meta.sha_algorithm -ne 'none') {
+    try {
+        $actual = (Get-FileHash -Path $incoming -Algorithm $meta.sha_algorithm).Hash
+        if ($actual -ne $meta.sha256) {
+            Write-Host "::warning title=Snapshot corrupt::Checksum mismatch ($actual vs $($meta.sha256)), not restoring."
+            Set-Status 'The snapshot was corrupt (checksum mismatch). Starting with a clean desktop; the old copy is still on the volume.'
+            exit 0
+        }
+        Say '[restore] checksum verified.'
+    } catch {
+        Say "[restore] checksum check skipped: $_"
     }
-    Say '[restore] sha256 verified.'
+}
+
+$format = ''
+if ($meta.format) { $format = [string]$meta.format }
+if ($format -match '7z') {
+    $archive = Join-Path $work 'restore.7z'
+} else {
+    $archive = Join-Path $work 'restore.tar.gz'
 }
 Move-Item -Force $incoming $archive
 
 # --- unpack -----------------------------------------------------------------
-$isGzip = $false
-$fs = [IO.File]::OpenRead($archive)
-try { $isGzip = ($fs.ReadByte() -eq 0x1f -and $fs.ReadByte() -eq 0x8b) } finally { $fs.Close() }
-
-Say '[restore] unpacking...'
-$target = 'C:\'
-$ok = Invoke-SevenZip -Arguments @('x', '-y', "-o$target", $archive)
-
+Say '[restore] unpacking into C:\ ...'
+$ok = (Invoke-TarExtract -Archive $archive)
 if (-not $ok) {
-    if ($isGzip) {
-        $tar = Join-Path $work 'restore.tar'
-        if (Invoke-SevenZip -Arguments @('x', '-y', "-o$work", $archive)) {
-            if (Test-Path $tar) {
-                $ok = Invoke-SevenZip -Arguments @('x', '-y', "-o$target", $tar)
-            }
+    Say '[restore] tar failed, trying 7-Zip'
+    $ok = Invoke-SevenZip -Arguments @('x', '-y', '-oC:\', $archive)
+    if (-not $ok -and $archive -like '*.tar.gz') {
+        # 7-Zip may need two passes for gz -> tar.
+        $inner = Join-Path $work 'tmp\restore.tar'
+        if (Invoke-SevenZip -Arguments @('x', '-y', "-o$(Split-Path $inner -Parent)", $archive) -and (Test-Path $inner)) {
+            $ok = Invoke-SevenZip -Arguments @('x', '-y', '-oC:\', $inner)
         }
-    } else {
-        $ok = $false
     }
 }
 
-if ($ok -and (Test-Path 'C:\vpsmajani-sync\data\paths.txt')) {
-    Say '[restore] restored paths:'
-    Get-Content 'C:\vpsmajani-sync\data\paths.txt' | ForEach-Object { Say "   $_" }
-}
+# Unblock files that came from another machine (SmartScreen marks them).
+try {
+    Get-ChildItem -Path (Get-ProfilePath) -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Length -lt 50MB } |
+        Unblock-File -ErrorAction SilentlyContinue
+} catch { }
 
 if ($ok) {
-    Set-Status "Restored snapshot from $($meta.saved_at) - your files are back."
+    Set-Status "Restored the snapshot from $($meta.saved_at). Your files should be back."
 } else {
     Set-Status 'Unpacking the snapshot failed. Starting with a clean desktop (the snapshot is still safe on the volume).'
 }
