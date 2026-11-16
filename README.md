@@ -1,234 +1,328 @@
 # vpsmajani — سرور ابری ویندوز «نامحدود» روی GitHub Actions
 
-یک ماشین ویندوزی روی رانرهای GitHub می‌سازد، RDP را باز می‌کند، با **Tailscale** به شبکهٔ
-خصوصی شما وصل می‌شود و بعد **تا ابد خودش را تمدید می‌کند**: ۱۲ دقیقه مانده به مرگِ هر ماشین،
-یک ماشین جایگزین با **همان IP و همان نام DNS** در صف می‌ایستد و به محض آزاد شدن، جای آن را
-می‌گیرد.
+یک ماشین ویندوزی روی رانرهای GitHub، با RDP باز و دسترسی از راه **Tailscale**، که:
+
+- **تا ابد روشن می‌ماند** — ۱۲ تا ۲۲ دقیقه قبل از پایانِ هر ماشین، ماشینِ جانشین از راه می‌رسد؛
+- **هیچ‌وقت خاموش نمی‌شود** — جانشین **هم‌زمان** با ماشین فعلی بالا می‌آید، داده‌هایتان را
+  برمی‌گرداند، و dopiero وقتی ماشین قبلی از نفس افتاد، آدرس دائمی را تحویل می‌گیرد؛
+- **اطلاعاتتان می‌ماند** — پوشه‌هایی که تعیین می‌کنید هر چند دقیقه یک‌بار به Google Drive
+  (یا هر مقصد rclone) همگام‌سازی می‌شوند و روی ماشین بعدی برمی‌گردند؛
+- **آدرسش عوض نمی‌شود** — همان IP و همان نام MagicDNS، حلقه به حلقه.
 
 فایل ورک‌فلو: [`.github/workflows/windows-rdp.yml`](.github/workflows/windows-rdp.yml)
 
 ---
 
-## چه چیزی تا کجا «نامحدود» شد
+## ۱) چه چیزی تا کجا باز شد
 
-| چیزی که قبلاً محدود بود | نسخهٔ قبل | الان | چطور |
+| محور | نسخهٔ اول | الان |
+|---|---|---|
+| زمان روشن بودن | «۴۸ ساعت» نوشته بود، ولی در عمل ساعت ۶ کشته می‌شد | **زنجیرهٔ بی‌پایان** از ماشین‌های ۶ ساعته |
+| قطعی هنگام تعویض | — | **صفر**: جانشین از قبل آنلاین است و داده‌ها را دارد |
+| اطلاعات | با ماشین نابود می‌شد | **rclone → Google Drive** (هر N دقیقه + یک sync نهایی) یا **باندل رمزنگاری‌شده در Actions cache** |
+| آدرس IP | هر بار تازه | **ثابت** — هویت نود با AES-256 رمزنگاری و در cache نگه داشته می‌شود |
+| نشست‌های RDP | پیش‌فرض | بدون سقف نشست، بدون idle/disconnect، keep-alive هر ۶۰ ثانیه |
+| تعداد ماشین | ۱ | تا **۲۰ ماشین موازی**، هرکدام با آدرس ثابت خودش |
+| قدرت | `windows-latest` | تا **۶۴ هسته**، یا `self-hosted` |
+| خواب/خاموشی | روشن | خاموش + پلن Maximum Performance |
+| مموری مجازی | پیش‌فرض | System-managed (بدون سقف) |
+| محدودیت شبکه | throttle ویندوز | `NetworkThrottlingIndex=0xffffffff`، `SystemResponsiveness=0`، QoS reserve = 0، `TcpNumConnections=16777214` |
+| آپدیت/دیفندر | روشن | Windows Update و Defender real-time خاموش |
+| مرورگر | IE-ESC فعال | خاموش + Chrome/Firefox نصب می‌شود |
+| راه دسترسی | فقط RDP | RDP + SSH + (اختیاری) exit node |
+| رمز عبور | هاردکد در فایل | secret (با mask) یا رمز تصادفی ۲۲ کاراکتری برای هر ماشین |
+| تحمل خطا | هیچ | hand-over با retry + استپ self-heal + فیوز ۳ بار |
+| ترمز | فقط Cancel | فایل `STOP-RDP`، متغیر `RDP_CHAIN_ENABLED`، رویداد `rdp-stop` |
+
+---
+
+## ۲) دو چیزی که هیچ YAML‌ای عوضشان نمی‌کند
+
+۱. **هر job روی رانرِ GitHub دقیقاً ۶ ساعت (۳۶۰ دقیقه) زنده است.** عدد بزرگ‌تر در
+   `timeout-minutes` بی‌اثر است. پس «نامحدود» یعنی زنجیرهٔ بی‌پایان، نه یک ماشین جاودان.
+   → **راه ماشین جاودان: بخش ۱۰ (self-hosted).**
+
+۲. **RAM و برنامه‌های باز منتقل نمی‌شوند.** ماشین قبلی با تمام پروسه‌هایش توسط GitHub نابود
+   می‌شود؛ هیچ فایلی روی دیسکِ آن باقی نمی‌ماند. چیزی که نجات پیدا می‌کند **فایل‌ها** هستند
+   (لایهٔ persistence) و **آدرس** (هویت Tailscale). مرورگرِ باز، بازی در حال اجرا، سندِ
+   ذخیره‌نشده → می‌روند. پس کارهایتان را داخل همان پوشه‌های sync‌شونده ذخیره کنید
+   (پیش‌فرض: `D:\Workspace`) و هر چند دقیقه یک‌بار Ctrl+S بزنید.
+
+موارد کوچک‌تر: ۲۰ job همزمان در پلن Free (ریپوی public دقیقهٔ رایگانِ بدون سقف دارد)،
+cache هر ریپو ۱۰ گیگابایت، و GPU وجود ندارد.
+
+---
+
+## ۳) hand-over بدون قطعی، دقیقاً چطور کار می‌کند
+
+```
+دقیقهٔ ۰        ماشین A بالا می‌آید ── در ~۲ دقیقه RDP و Tailscale آماده
+دقیقهٔ ۲+       تنظیمات سیستم، بازیابی داده‌ها، SSH و نرم‌افزارها در پس‌زمینه
+هر ۱۰ دقیقه     rclone sync به Drive  (فایل‌های شما بیرون از ماشین ذخیره می‌شود)
+دقیقهٔ ۳۳۸      ماشین B dispatch می‌شود ── A هنوز زنده است و شما هنوز وصلید
+دقیقهٔ ۳۴۰      B بالا می‌آید، با یک نام **موقت** به Tailscale وصل می‌شود،
+                داده‌های شما را از Drive برمی‌گرداند ── هیچ تداخلی با A ندارد
+دقیقهٔ ۳۵۴      A آخرین sync کامل را می‌زند
+دقیقهٔ ۳۵۹      A بازنشسته می‌شود ── B می‌فهمد نودِ دائمی offline شد،
+                هویت دائمی را تحویل می‌گیرد: **همان IP، همان نام**
+دقیقهٔ ۳۶۰      B یک restore تکمیلی می‌زند تا آخرین تغییرات A هم برسد
+```
+
+چرا نام موقت؟ چون دو ماشین زنده با یک هویت Tailscale سرِ یک IP می‌جنگند و شبکه ناپایدار
+می‌شود ([tailscale/tailscale#506](https://github.com/tailscale/tailscale/issues/506)).
+پس B اول با نام `<hostname>-r<run>` بالا می‌آید، و **فقط بعد از offline شدن A** هویت دائمی
+را claim می‌کند. اگر claim ناموفق باشد، خودش به نام موقت برمی‌گردد تا دسترسی شما قطع نشود.
+
+در تمام این مدت **شما می‌توانید وصل بمانید**: یا روی A تا لحظهٔ آخر، یا از دقیقهٔ ۳۴۰ روی B.
+
+---
+
+## ۴) ماندگاری اطلاعات
+
+دو حالت دارد؛ ورودی `persist_mode`:
+
+| حالت | نیاز به تنظیم | سرعت/حجم | توضیح |
 |---|---|---|---|
-| زمان روشن بودن | ۴۸ ساعت نوشته شده بود، ولی در عمل ۶ ساعت کشته می‌شد | **بی‌پایان** (زنجیرهٔ خودکار، ۶ ساعت در هر حلقه) | `workflow_dispatch` روی حلقهٔ بعدی + شمارندهٔ `chain_depth` |
-| آدرس IP | هر بار یک IP تازه | **همیشه ثابت** | هویت نود Tailscale رمزنگاری‌شده در Actions cache ذخیره و بازیابی می‌شود |
-| قطعی هنگام تمدید | — | **~۲ تا ۴ دقیقه در هر ۶ ساعت** | اول RDP و Tailscale بالا می‌آیند، کارهای سنگین بعداً در پس‌زمینه نصب می‌شوند |
-| نشست‌های RDP | پیش‌فرض ویندوز | **بدون محدودتِ نشست** | `fSingleSessionPerUser=0`، `MaxInstanceCount=0xffffffff` |
-| قطع شدن نشست | idle/disconnect پیش‌فرض | **هرگز** | `MaxIdleTime=0`، `MaxDisconnectionTime=0`، keep-alive هر ۶۰ ثانیه |
-| سازگاری کلاینت | فقط NLA | NLA اختیاری | `UserAuthentication=0`، `SecurityLayer=1` |
-| تعداد ماشین همزمان | ۱ | **تا ۲۰ ماشین موازی** | ورودی `instances` + `strategy.matrix` |
-| قدرت ماشین | `windows-latest` | قابل انتخاب تا **۶۴ هسته** | ورودی `runner` |
-| خواب/خاموشی صفحه | روشن | **خاموش** | `powercfg` + پلن Maximum Performance |
-| مموری مجازی | پیش‌فرض | **System-managed (بدون سقف)** | `AutomaticManagedPagefile=true` |
-| محدودیت پهنای باند | throttle پیش‌فرض ویندوز | **حذف شد** | `NetworkThrottlingIndex=0xffffffff`، `SystemResponsiveness=0`، `NonBestEffortLimit=0` |
-| اتصالات TCP | پیش‌فرض | **بدون سقف عملی** | `TcpNumConnections=16777214`، `MaxUserPort=65534`، autotuning |
-| ری‌استارت ناخواستهٔ آپدیت | ممکن | **غیرفعال** | سرویس‌ها و تسک‌های Windows Update خاموش |
-| آنتی‌ویروس (کندی) | روشن | **Real-time خاموش** | `Set-MpPreference` + exclusion |
-| مرورگر | IE-ESC فعال و غیرقابل استفاده | **باز** | IE Enhanced Security Configuration خاموش |
-| راه دسترسی | فقط RDP | **RDP + SSH + (اختیاری) exit node** | OpenSSH Server + `--advertise-exit-node` |
-| نرم‌افزار نصب‌شده | هیچ | Chrome, Firefox, 7zip, Git, Python, Node, VS Code, VLC | Chocolatey در پس‌زمینه، قابل تغییر با ورودی `packages` |
-| رمز عبور | هاردکد شده در فایل | **secret یا تصادفی قوی برای هر ماشین** | `secrets.RDP_PASSWORD` یا تولید خودکار |
-| تحمل خطا | هیچ | **self-heal + فیوز ۳ بار** | استپ `10 · Self-heal` با `if: failure()` |
-| ترمز | فقط Cancel دستی | **۳ ترمز مستقل** | فایل `STOP-RDP`، متغیر `RDP_CHAIN_ENABLED`، رویداد `rdp-stop` |
+| `drive` | secret `RCLONE_CONF` | نامحدود، افزایشی | **پیشنهادی.** rclone هر N دقیقه و یک‌بار هم موقع بازنشستگی، پوشه‌ها را به Google Drive (یا OneDrive/Dropbox/S3/Mega…) می‌برد |
+| `cache` | هیچ | تا ~۱۰ گیگ | باندل `tar` + **AES-256** در Actions cache؛ موقع بازنشستگی ماشین قبلی، بستهٔ نهایی‌اش برداشته و باز می‌شود |
+| `auto` (پیش‌فرض) | — | — | اگر `RCLONE_CONF` باشد → `drive`، وگرنه → `cache` |
+| `none` | — | — | خاموش |
+
+**امنیت:** ریپوی شما public است و cache یک ریپوی public با توکنِ یک PR از fork هم خوانده
+می‌شود؛ به همین دلیل هر چیزی که در cache می‌گذاریم (هم هویت Tailscale، هم باندل داده)
+با کلیدی که از secret ساخته می‌شود **رمزنگاری** می‌شود. بدون secret، آن فایل‌ها فقط نویز‌اند.
+
+### راه‌اندازی Google Drive (یک بار، ~۵ دقیقه)
+
+راحت‌ترین جا **خودِ همان ماشین RDP** است، چون rclone و مرورگر رویش نصب است:
+
+```powershell
+C:\rclone\rclone.exe config
+```
+
+پاسخ‌ها به ترتیب:
+
+| سؤال | جواب |
+|---|---|
+| `n/q>` | `n` (new remote) |
+| name | `gdrive` |
+| Storage | عددِ `drive` (Google Drive) |
+| client_id | **خالی** (Enter) — rclone کلید خودش را دارد |
+| client_secret | **خالی** (Enter) |
+| scope | `drive` (دسترسی کامل به فایل‌های خودش) |
+| service_account_file | خالی |
+| `Use auto config?` | `n` (ماشین headless است) |
+| | یک URL می‌دهد → در مرورگر باز کنید → به حساب گوگل وارد شوید → کد را کپی و در ترمینال paste کنید |
+| `y/e/d>` | `y` |
+| `e/n/d/s/q>` | `q` |
+
+بعد محتوای فایل کانفیگ را ببینید و **کامل** کپی کنید:
+
+```powershell
+notepad $env:APPDATA\rclone\rclone.conf
+```
+
+و در `Settings → Secrets and variables → Actions → Secrets` یک secret به نام
+**`RCLONE_CONF`** بسازید و آن متن را داخلش بگذارید. از اجرای بعدی، حالت `auto` خودش
+`drive` را انتخاب می‌کند و همه‌چیز خودکار است.
+
+مسیر مقصد در Drive به این شکل ساخته می‌شود (خودکار):
+
+```
+gdrive:vpsmajani/<hostname>-<slot>/D_Workspace/
+```
+
+با ورودی‌ها/کلیدهای `options` قابل تغییر است (`sync_remote`، `sync_folder`، `sync_minutes`).
+
+> **یک قفل ایمنی مهم:** تا وقتی بازیابی داده‌ها با موفقیت تمام نشود، هیچ backup‌ای انجام
+> نمی‌شود. چون `rclone sync` فایل‌های سمتِ مقصد (remote) را با نمونهٔ محلی یکی می‌کند؛ اگر ماشین تازه
+> (و خالی) قبل از restore سینک می‌زد، کل بکاپ شما از Drive پاک می‌شد.
 
 ---
 
-## سقف‌هایی که با YAML عوض نمی‌شوند (صادقانه)
+## ۵) پیش‌نیازها
 
-این‌ها محدودیت پلتفرم‌اند، نه باگ تنظیمات:
+**۱. ورک‌فلو باید روی برنچ پیش‌فرض (`main`) باشد** — هم دکمهٔ Run workflow و هم زنجیرهٔ
+تمدید فقط از آن‌جا کار می‌کنند. (PR #2 را merge کنید.)
 
-- **هر job روی رانرِ GitHub حداکثر ۶ ساعت (۳۶۰ دقیقه).** مقدارِ بیشتر در `timeout-minutes`
-  بی‌اثر است و job دقیقاً در ساعت ششم کشته می‌شود. «نامحدود» اینجا یعنی **زنجیرهٔ بی‌پایانِ
-  ماشین‌های ۶ ساعته با آدرس ثابت**، نه یک ماشین جاودان.
-- **job همزمان:** Free = ۲۰، Pro = ۴۰، Team = ۶۰ (ورودی `instances` تا ۲۰slot را پوشش می‌دهد).
-- **دقیقهٔ رایگان:** برای ریپوی **public** رایگان و بدون سقف است (حالت شما). برای ریپوی private
-  ۲۰۰۰ دقیقه در ماه، و ویندوز ضریب ۲ دارد.
-- **ماشین هر بار نو است:** دیسک، RAM و هر چیزی که روی درایو ذخیره کرده‌اید با پایان job از بین
-  می‌رود. تنها چیزی که بین حلقه‌ها منتقل می‌شود، هویت Tailscale است (برای ثابت ماندن IP).
-  برای ذخیرهٔ واقعی داده، به Google Drive / OneDrive / یک repo دیگر push کنید.
-- **GPU وجود ندارد** — رانرهای ویندوز GitHub GPU ندارند.
-
-### یک ماشین جاودان می‌خواهید؟ → self-hosted
-
-اگر یک کامپیوتر/سرور همیشه‌روشن دارید، همان ورک‌فلو را با ورودی `runner = self-hosted` و
-`duration = 4320` اجرا کنید: **۷۲ ساعت در یک job**، بدون مصرف دقیقهٔ GitHub، و بدون هیچ
-hand-over‌ای. این تنها راهِ یک ماشینِ واقعاً یک‌تکه و بی‌قطعی است.
-
----
-
-## پیش‌نیازها (یک بار، ۵ دقیقه)
-
-**۱. فایل ورک‌فلو باید روی برنچ پیش‌فرض (`main`) باشد.**
-`workflow_dispatch` فقط برای ورک‌فلویی کار می‌کند که روی برنچ پیش‌فرض وجود دارد؛ زنجیرهٔ
-تمدید خودکار هم به همین دلیل فقط از `main` قابل dispatch است. پس این برنچ را merge کنید.
-
-**۲. کلید Tailscale بسازید** — از <https://login.tailscale.com/admin/settings/keys>:
+**۲. کلید Tailscale** از <https://login.tailscale.com/admin/settings/keys>:
 
 | گزینه | مقدار | چرا |
 |---|---|---|
-| Reusable | **روشن** | هر حلقهٔ زنجیره یک ماشین تازه است |
-| Ephemeral | **خاموش** | اگر روشن باشد، نود با خاموش شدن ماشین پاک می‌شود و IP عوض می‌شود |
+| Reusable | **روشن** | هر حلقه یک ماشین تازه است |
+| Ephemeral | **خاموش** | وگرنه نود با خاموش شدن ماشین پاک می‌شود و IP ثابت نمی‌ماند |
 | Expiration | **بدون انقضا** | وگرنه وسط کار کلید می‌سوزد |
-| Pre-approved tags | اختیاری `tag:rdp` | برای exit node و سیاست‌های ACL |
 
-**۳. Secretها** — در `Settings → Secrets and variables → Actions`:
+**۳. Secretها**
 
-| نام | لازم؟ | کارکرد |
+| نام | لازم | کارکرد |
 |---|---|---|
-| `TAILSCALE_AUTHKEY` | **بله** | کلید بالا؛ همچنین کلید رمزنگاری هویت ذخیره‌شده |
-| `RDP_PASSWORD` | نه | رمز ثابت؛ اگر باشد در لاگ **mask** می‌شود (امن‌تر) |
-| `TAILSCALE_IDENTITY_KEY` | نه | اگر خواستید کلید رمزنگاری هویت جدا از authkey باشد |
-
-> اگر `RDP_PASSWORD` را نگذارید، برای هر ماشین یک رمز تصادفی ۲۲ کاراکتری ساخته می‌شود و در
-> لاگ و Job summary چاپ می‌شود (راحت‌تر، ولی چون ریپوی شما **public** است، لاگ‌ها هم عمومی‌اند).
+| `TAILSCALE_AUTHKEY` | **بله** | اتصال به tailnet + کلید رمزنگاری هویت و باندل داده |
+| `RCLONE_CONF` | برای `drive` | محتوای rclone.conf (بخش ۴) |
+| `RDP_PASSWORD` | نه | رمز ثابت؛ در لاگ **mask** می‌شود |
+| `TAILSCALE_IDENTITY_KEY` | نه | اگر می‌خواهید کلید رمزنگاری از authkey جدا باشد |
 
 ---
 
-## اجرا
-
-از تب **Actions → Windows Cloud RDP · Unlimited → Run workflow**، یا با `gh`:
+## ۶) اجرا
 
 ```bash
-# یک ماشین، ۶ ساعت، تمدید خودکار بی‌پایان (همه‌چیز پیش‌فرض)
+# ساده‌ترین حالت: یک ماشین، بی‌پایان، با persistence خودکار
 gh workflow run windows-rdp.yml
 
-# سه ماشین موازی
-gh workflow run windows-rdp.yml -f instances='[1,2,3]'
+# داده‌ها روی Drive + سه ماشین موازی
+gh workflow run windows-rdp.yml -f persist_mode=drive -f instances='[1,2,3]' \
+  -f persist_paths='D:\Workspace,C:\Users\NvDAdmin\Desktop'
 
-# ماشین قوی‌تر + بدون نرم‌افزار اضافه + ۲۴ حلقه (≈ ۶ روز) و بس
-gh workflow run windows-rdp.yml -f runner=windows-latest-16-cores -f packages=none -f max_chain=24
-
-# بدون تمدید خودکار، فقط یک ماشین ۶ ساعته
+# بدون تمدید خودکار (فقط یک ماشین ۶ ساعته)
 gh workflow run windows-rdp.yml -f renew=false
-
-# از راه دور، بدون ورود به سایت
-gh api repos/mahdiyar1388mm1-design/vpsmajani/dispatches -f event_type=rdp-start
 ```
 
----
+یا از تب **Actions → Windows Cloud RDP · Unlimited → Run workflow**.
 
-## اتصال
-
-اطلاعات در **لاگ استپ `07 · Publish connection details`** و در **Job summary** چاپ می‌شود:
+اطلاعات اتصال در لاگِ استپ `06 · Publish connection details` و در **Job summary** است،
+و روی خود ماشین هم در `C:\RDP-CREDENTIALS.txt`:
 
 ```
-================================================================
+==================================================================
     >>>   U N L I M I T E D   R D P   I S   L I V E   <<<
-================================================================
-  Tailscale IP : 100.x.y.z
-  MagicDNS     : github-rdp-server.tail1234.ts.net
-  Username     : NvDAdmin   (also runneradmin)
-  Password     : Xk9...
-  SSH          : ssh NvDAdmin@100.x.y.z
-  Alive until  : 2026-11-16 21:40 UTC
-  Auto-renew   : true (link #1 of unlimited)
+==================================================================
+  Address now  : 100.x.y.z   (github-rdp-server.tail1234.ts.net)
+  Permanent    : github-rdp-server
+  Username     : NvDAdmin  (also runneradmin)
+  Password     : ...
+  Retires at   : 2026-11-16 21:40 UTC
+  Data         : drive mode, D:\Workspace
   >> mstsc /v:100.x.y.z
-================================================================
+==================================================================
 ```
-
-- **ویندوز:** `mstsc /v:100.x.y.z` — همین آدرس را pin کنید، بعد از هر تمدید همان است.
-- **موبایل/لینوکس:** کلاینت Tailscale را نصب کنید، بعد با Microsoft Remote Desktop به همان IP.
-- **SSH:** `ssh NvDAdmin@100.x.y.z` (شل پیش‌فرض PowerShell است).
-- روی خود ماشین هم فایل `C:\RDP-CREDENTIALS.txt` هست.
 
 ---
 
-## ورودی‌ها
+## ۷) ورودی‌ها
+
+`workflow_dispatch` حداکثر **۱۰ ورودی** می‌پذیرد (محدودیت خودِ GitHub)، پس تنظیمات پیشرفته
+همه داخل یک ورودی JSON به نام `options` هستند.
 
 | ورودی | پیش‌فرض | توضیح |
 |---|---|---|
-| `instances` | `[1]` | چند ماشین موازی؛ مثلاً `[1,2,3,4]` = چهار ماشین با چهار IP ثابت جداگانه |
-| `runner` | `windows-latest` | `windows-2025`، `windows-latest-8-cores` … `64-cores` (باید در Settings فعال باشند)، یا `self-hosted` |
-| `duration` | `360` | دقیقه برای هر ماشین؛ سقف رانر GitHub = ۳۶۰، سقف self-hosted = ۴۳۲۰ |
-| `handover` | `12` | چند دقیقه مانده به پایان، ماشین جایگزین در صف بایستد (و در صورت خطا، هر دقیقه دوباره تلاش می‌کند) |
+| `instances` | `[1]` | چند ماشین موازی؛ مثلاً `[1,2,3,4]` |
+| `runner` | `windows-latest` | تا `windows-latest-64-cores` یا `self-hosted` |
+| `duration` | `360` | دقیقه برای هر ماشین (رانر GitHub: سقف ۳۶۰، self-hosted: ۴۳۲۰) |
+| `overlap` | `15` | چند دقیقه قبل از بازنشستگی، جانشین بالا بیاید |
 | `renew` | `true` | زنجیرهٔ بی‌پایان |
-| `max_chain` | `0` | حداکثر تعداد حلقه؛ `0` = نامحدود |
-| `hostname` | `github-rdp-server` | نام نود در Tailscale (بین حلقه‌ها ثابت می‌ماند) |
-| `packages` | کروم، فایرفاکس، 7zip، git، python، nodejs، vscode، vlc | با `none` کاملاً رد می‌شود |
-| `ssh` | `true` | سرور OpenSSH روی پورت ۲۲ |
-| `exit_node` | `false` | ماشین را exit node می‌کند؛ بعد باید در کنسول Tailscale تأییدش کنید |
-| `reset_runneradmin` | `true` | اکانت داخلی رانر هم همان رمز را می‌گیرد |
-| `persist_identity` | `true` | ثابت نگه داشتن IP بین حلقه‌ها (رمزنگاری‌شده در cache) |
-| `tailscale_args` | خالی | آرگومان خام اضافه برای `tailscale up` |
-| `chain_depth`, `chain_heals` | `0` | **داخلی** — خود زنجیره پر می‌کند، دست نزنید |
+| `hostname` | `github-rdp-server` | نام/آدرس دائمی در Tailscale |
+| `packages` | کروم، فایرفاکس، 7zip، git، python، nodejs، vscode، vlc | `none` = نصب نشود |
+| `persist_mode` | `auto` | `auto` / `drive` / `cache` / `none` |
+| `persist_paths` | `D:\Workspace` | پوشه‌هایی که باید بمانند، با کاما جدا کنید |
+| `options` | `{}` | JSON تنظیمات پیشرفته (جدول زیر) |
+
+کلیدهای `options`:
+
+```json
+{
+  "max_chain": 0,              // 0 = بی‌نهایت حلقه
+  "depth": 0,                  // داخلی - شمارهٔ حلقه
+  "heals": 0,                  // داخلی - شمارندهٔ self-heal
+  "ssh": true,                 // سرور OpenSSH روی پورت ۲۲
+  "exit_node": false,          // exit node (نیاز به تأیید در کنسول Tailscale)
+  "reset_runneradmin": true,   // اکانت داخلی رانر هم همان رمز را بگیرد
+  "persist_identity": true,    // IP ثابت بین حلقه‌ها
+  "tailscale_args": "",        // آرگومان خام اضافه برای tailscale up
+  "sync_remote": "gdrive",     // نام remote در rclone.conf
+  "sync_folder": "vpsmajani",  // پوشهٔ مقصد
+  "sync_minutes": 10,          // فاصلهٔ بین sync‌ها
+  "persist_exclude": "$RECYCLE.BIN/**,*/AppData/Local/Temp/**,*.tmp,pagefile.sys,hiberfil.sys"
+}
+```
+
+مثال: `gh workflow run windows-rdp.yml -f options='{"ssh":false,"sync_minutes":5,"exit_node":true}'`
 
 ---
 
-## زنجیرهٔ تمدید خودکار چطور کار می‌کند
-
-```
-دقیقهٔ 0        ماشین #1 بالا می‌آید ── RDP + Tailscale در ~۲ دقیقه آماده
-دقیقهٔ ۲ تا ۶۰  تنظیمات سیستم و نصب نرم‌افزارها در پس‌زمینه (task با کاربر SYSTEM)
-دقیقهٔ ۳۴۸      لینک #2 dispatch می‌شود ── پشتِ concurrency در صف می‌ایستد
-دقیقهٔ ۳۶۰      ماشین #1 خاموش می‌شود ── همان لحظه ماشین #2 boot می‌شود
-                هویت رمزنگاری‌شده از cache برمی‌گردد ── همان IP، همان نام DNS
-دقیقهٔ ~۳۶۳     ماشین #2 در دسترس است  ── و این تا ابد تکرار می‌شود
-```
-
-- `concurrency: rdp-slot-N` باعث می‌شود دو ماشین هیچ‌وقت هم‌زمان از یک هویت Tailscale
-  استفاده نکنند (این کار IP را خراب می‌کند).
-- در حالت چند ماشینی (`instances='[1,2,3]'`)، فقط **slot اول** حلقهٔ بعدی را می‌سازد و آن
-  حلقه همهٔ slot‌ها را با هم برمی‌گرداند؛ پس هر ماشین IP ثابتِ خودش را دارد.
-- اگر dispatch به هر دلیلی شکست بخورد، تا آخرین دقیقه هر ۶۰ ثانیه دوباره تلاش می‌شود.
-- اگر job **کرش** کند، استپ `10 · Self-heal` یک ماشین جایگزین می‌فرستد تا زنجیره قطع نشود.
-  **فیوز:** اگر ماشین قبل از وصل شدن به Tailscale بمیرد، زنجیره ادامه پیدا نمی‌کند (وگرنه یک
-  حلقهٔ خراب بی‌نهایت دقیقه می‌سوزاند)؛ و پشت‌سرهم حداکثر ۳ self-heal مجاز است.
-
----
-
-## ترمزها
+## ۸) ترمزها
 
 | روش | اثر |
 |---|---|
-| ساخت فایل `STOP-RDP` در ریشهٔ ریپو (روی `main`) | حلقهٔ بعدی ساخته نمی‌شود؛ ماشین فعلی تا پایان ۶ ساعت زنده می‌ماند |
-| متغیر `RDP_CHAIN_ENABLED = false` در `Settings → Secrets and variables → Actions → Variables` | دقیقاً مثل بالا، بدون commit |
+| فایل `STOP-RDP` در ریشهٔ ریپو (روی `main`) | حلقهٔ بعدی ساخته نمی‌شود؛ ماشین فعلی تا آخر ۶ ساعت زنده می‌ماند و داده‌ها را sync می‌کند |
+| متغیر `RDP_CHAIN_ENABLED = false` | همان اثر، بدون commit |
 | `gh api repos/mahdiyar1388mm1-design/vpsmajani/dispatches -f event_type=rdp-stop` | **فوری:** همهٔ run‌های در حال اجرا و در صف کنسل می‌شوند |
-| دکمهٔ Cancel workflow در تب Actions | همان ماشین را فوراً می‌کشد |
+| Cancel workflow در تب Actions | همان ماشین را می‌کشد |
+
+> برای اینکه **همین الان** چیزی که در حال اجراست خاموش نشود: هیچ‌کدام از این‌ها را نزنید.
+> ورک‌فلوی جدید جای run‌های در حال اجرا را نمی‌گیرد و کنسلشان نمی‌کند؛ یک runِ در حال اجرا
+> تا آخر با همان نسخه‌ای که با آن شروع شده ادامه می‌دهد. (نسخهٔ قبلی `concurrency` نداشت،
+> و نسخهٔ جدید هم عمداً ندارد تا جانشین بتواند هم‌زمان بالا بیاید.)
 
 ---
 
-## امنیت (حتماً بخوانید)
+## ۹) امنیت
 
-1. **ریپوی شما public است** ⇒ لاگ‌های Actions هم public‌اند. اگر `RDP_PASSWORD` را ست نکنید،
-   رمز ماشین در لاگ عمومی دیده می‌شود. دسترسی واقعی فقط از طریق Tailscale ممکن است، ولی
-   توصیهٔ جدی: یا `RDP_PASSWORD` بگذارید (تا mask شود)، یا ریپو را private کنید.
-2. هویت نود Tailscale در Actions cache ذخیره می‌شود. در ریپوی public، یک PR از fork می‌تواند
-   cache را بخواند — به همین دلیل آن را با کلید مشتق‌شده از secret **AES-256 رمزنگاری** می‌کنیم؛
-   بدون secret، آن فایل فقط نویز است.
-3. NLA خاموش شده تا کلاینت‌های موبایل/قدیمی وصل شوند؛ در عوض یک لایهٔ احراز هویت کمتر است.
-   اگر فقط از کلاینت‌های جدید استفاده می‌کنید، `UserAuthentication=1` امن‌تر است.
-4. Defender real-time و Windows Update خاموش می‌شوند: ماشین سریع‌تر است، ولی به‌روز نمی‌شود.
-   این ماشین هر ۶ ساعت از نو ساخته می‌شود، عملاً همیشه با ایمیج تازه است.
-5. `exit_node=true` یعنی هر ترافیکی که از آن عبور دهید با IP این ماشین بیرون می‌رود؛ فقط در
-   صورت نیاز روشنش کنید و در کنسول Tailscale تأییدش کنید.
+1. ریپو **public** است ⇒ لاگ‌های Actions هم public‌اند. رمز در لاگ چاپ می‌شود؛ اگر
+   `RDP_PASSWORD` را بگذارید GitHub آن را mask می‌کند. دسترسی شبکه فقط از Tailscale ممکن است.
+2. هویت Tailscale و باندل داده‌ها در cache **رمزنگاری‌شده** ذخیره می‌شوند (کلید از secret).
+3. `rclone.conf` شامل refresh token حساب گوگل شماست ⇒ حتماً به‌صورت **secret** نگهش دارید،
+   نه در فایل ریپو.
+4. NLA خاموش است تا کلاینت‌های موبایل/قدیمی وصل شوند (یک لایه احراز هویت کمتر).
+5. Defender real-time و Windows Update خاموش‌اند؛ ماشین هر ۶ ساعت از نو با ایمیج تازه ساخته
+   می‌شود، عملاً همیشه به‌روز است.
 
 ---
 
-## عیب‌یابی
+## ۱۰) راهِ واقعیِ «خاموش نشدن»: self-hosted
+
+اگر یک کامپیوتر همیشه‌روشن (یا یک VPS ارزان) دارید، همان ورک‌فلو را رویش اجرا کنید و همهٔ
+سقف‌ها برداشته می‌شود:
+
+```powershell
+# روی ویندوزِ خودتان، با PowerShell مدیر
+mkdir C:\actions-runner; cd C:\actions-runner
+# لینک دانلود و توکن را از Settings -> Actions -> Runners -> New self-hosted runner بردارید
+Invoke-WebRequest <runner-url>.zip -OutFile runner.zip
+Expand-Archive runner.zip -DestinationPath .
+.\config.cmd --url https://github.com/mahdiyar1388mm1-design/vpsmajani --token <TOKEN> --runasservice
+.\run.cmd
+```
+
+بعد:
+
+```bash
+gh workflow run windows-rdp.yml -f runner=self-hosted -f duration=4320 -f persist_mode=none
+```
+
+- **۷۲ ساعت در یک job** (و اگر `renew=true` باشد، بی‌پایان)
+- **دیسک خودتان است** ⇒ هیچ‌چیز پاک نمی‌شود، `persist_mode=none` کافی است
+- **دقیقهٔ GitHub مصرف نمی‌شود**
+- RAM و برنامه‌های باز هم سر جایشان می‌مانند
+
+---
+
+## ۱۱) عیب‌یابی
 
 | مشکل | علت / راه‌حل |
 |---|---|
-| `Run workflow` دیده نمی‌شود | فایل ورک‌فلو روی `main` نیست — merge کنید |
-| `HTTP 403: Resource not accessible` هنگام تمدید | `permissions: actions: write` حذف شده؛ یا از PAT استفاده شده |
-| `HTTP 404` هنگام تمدید | ورک‌فلو روی برنچ پیش‌فرض نیست |
-| IP هر بار عوض می‌شود | authkey **ephemeral** است (خاموشش کنید)، یا `persist_identity=false` است، یا اولین اجرا را از برنچی غیر از `main` زده‌اید (cache به برنچ‌ها مقید است) |
-| `tailscale up` شکست می‌خورد | Secret `TAILSCALE_AUTHKEY` نیست یا منقضی شده؛ هویت ذخیره‌شده هم سوخته → خودکار از نو ثبت می‌شود |
-| RDP وصل می‌شود ولی صفحه سیاه است | یک دقیقه صبر کنید؛ تنظیمات پس‌زمینه هنوز در حال اجراست (`C:\unlimited-setup.log`) |
-| ماشین زودتر از ۶ ساعت مرد | `duration` را کمتر از ۳۶۰ گذاشته‌اید، یا GitHub به خاطر نقص قوانین run را کنسل کرده |
-| `no runners available` | لیبل بزرگ‌تر (`-16-cores`) در ریپو فعال نیست؛ `Settings → Actions → Runners` |
-| می‌خواهم داده‌هایم بماند | روی ماشین هیچ‌چیز نمی‌ماند؛ به Drive/OneDrive sync کنید یا `git push` بزنید |
+| `Run workflow` دیده نمی‌شود | فایل روی `main` نیست — PR را merge کنید |
+| `workflow file is invalid: too many inputs` | بیش از ۱۰ ورودی تعریف شده (این ورک‌فلو رعایت کرده) |
+| IP هر بار عوض می‌شود | authkey **ephemeral** است، یا `persist_identity=false`، یا اولین اجرا را از برنچی غیر از `main` زده‌اید (cache به برنچ مقید است) |
+| `REFUSING to back up` در لاگ sync | یعنی قفل ایمنی فعال است: restore موفق نبوده، پس backup انجام نمی‌شود تا بکاپ قبلی پاک نشود. لاگ `C:\unlimited-setup.log` را ببینید |
+| داده‌ها برنگشت | `persist_mode` روی `none` است؟ مسیرها درست‌اند؟ در حالت `drive` نام remote دقیقاً همان چیزی است که در `sync_remote` نوشته‌اید؟ |
+| `Could not claim the permanent identity` | نود دائمی هنوز online بود یا کلید سوخته؛ ماشین روی آدرس موقت در دسترس می‌ماند و در لاگ چاپ می‌شود |
+| `tailscale up` شکست | `TAILSCALE_AUTHKEY` نیست/منقضی است |
+| RDP وصل است ولی صفحه سیاه | تنظیمات پس‌زمینه هنوز اجراست؛ `C:\unlimited-setup.log` را نگاه کنید |
+| `no runners available` | لیبل بزرگ‌تر (`-16-cores`) در ریپو فعال نیست |
+| ماشین زودتر از ۶ ساعت مرد | `duration` را کمتر گذاشته‌اید، یا GitHub به دلیل نقض قوانین کنسل کرده |
 
 ---
 
-## ابزار توسعه
+## ۱۲) ابزار توسعه
 
-`tools/lint_workflow.py` بدون نیاز به `actionlint` یا PowerShell، ساختار ورک‌فلو را بررسی
-می‌کند: صحت YAML، متوازن بودن `${{ }}`، context‌های مجاز، بسته شدن here-stringها در ستون صفر،
-و متوازن بودن براکت‌ها در هر دو اسکریپتِ تو‌در‌تو.
+`tools/lint_workflow.py` بدون نیاز به `actionlint` یا PowerShell ساختار ورک‌فلو را بررسی
+می‌کند: صحت YAML، سقف ۱۰ ورودیِ `workflow_dispatch`، متوازن بودن `${{ }}`ها، context‌های
+مجاز، وجود داشتنِ step id‌هایی که به آن‌ها ارجاع شده، **استفادهٔ ممنوع از `env` داخل `if:`**
+(چون متغیرهای نوشته‌شده در `GITHUB_ENV` آن‌جا قابل اتکا نیستند)، بسته شدن here-stringها در
+ستون صفر، و متوازن بودن براکت‌ها در هر سه اسکریپتِ تو‌در‌تو.
 
 ```bash
 python3 tools/lint_workflow.py
+# OK - 2 job(s), 20 step(s), 0 warning(s)
 ```

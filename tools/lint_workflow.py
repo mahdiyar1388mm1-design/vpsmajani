@@ -153,6 +153,43 @@ def check_expressions(text, where):
 
 check_expressions(raw, "file")
 
+# --- platform limits GitHub enforces on the workflow file itself -------------
+wd = (triggers or {}).get("workflow_dispatch") or {}
+wd_inputs = wd.get("inputs") or {}
+if len(wd_inputs) > 10:
+    err(f"workflow_dispatch has {len(wd_inputs)} inputs; GitHub allows at most 10")
+for name, spec in wd_inputs.items():
+    if isinstance(spec, dict) and spec.get("type") == "choice":
+        opts = spec.get("options") or []
+        if not 1 <= len(opts) <= 100:
+            err(f"input '{name}': choice needs 1..100 options, got {len(opts)}")
+    if isinstance(spec, dict) and len(str(spec.get("description", ""))) > 1000:
+        warn(f"input '{name}': description over 1000 chars may be rejected")
+
+# --- step ids referenced by expressions must exist --------------------------
+all_ids = set()
+for job in jobs.values():
+    for step in job.get("steps") or []:
+        if step.get("id"):
+            all_ids.add(step["id"])
+for m in re.finditer(r"steps\.([A-Za-z0-9_-]+)\.", raw):
+    if m.group(1) not in all_ids:
+        err(f"expression references unknown step id '{m.group(1)}'")
+
+# --- runtime-written env vars are not reliably visible to `if:` -------------
+runtime_env = set(re.findall(r"""GITHUB_ENV[^\n]*?["']([A-Z0-9_]+)=""", raw))
+for jid, job in jobs.items():
+    for i, step in enumerate(job.get("steps") or []):
+        cond = step.get("if")
+        if isinstance(cond, str):
+            for m in re.finditer(r"env\.([A-Za-z0-9_]+)", cond):
+                if m.group(1) in runtime_env:
+                    err(f"job {jid} step #{i}: `if:` reads env.{m.group(1)}, which is only "
+                        f"written at runtime via GITHUB_ENV - use a step output instead")
+            if re.search(r"env\.[A-Z0-9_]+", cond):
+                warn(f"job {jid} step #{i}: `if:` uses the env context ({cond!r}); "
+                     "prefer steps.<id>.outputs for anything computed at runtime")
+
 for jid, job in jobs.items():
     if "runs-on" not in job:
         err(f"job {jid}: missing runs-on")
