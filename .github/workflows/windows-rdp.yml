@@ -208,6 +208,7 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "persist_mode=$mode"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_MODE=$mode"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_DEPTH=$([int](Get-Opt 'depth' 0))"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_PARENT_RUN=$(Get-Opt 'parent_run' '')"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_HEALS=$([int](Get-Opt 'heals' 0))"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_MAX_CHAIN=$([int](Get-Opt 'max_chain' 0))"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_SSH=$(Get-Flag 'ssh' $true)"
@@ -322,7 +323,7 @@ jobs:
           $opt = $null
           try { $opt = $env:X_OPTIONS_RAW | ConvertFrom-Json } catch { }
           if (-not $opt) { $opt = [pscustomobject]@{} }
-          foreach ($kv in @{ depth = $depth + 1; heals = $nextHeals }.GetEnumerator()) {
+          foreach ($kv in @{ depth = $depth + 1; heals = $nextHeals; parent_run = "$env:GITHUB_RUN_ID" }.GetEnumerator()) {
             if ($opt.PSObject.Properties[$kv.Key]) { $opt.($kv.Key) = $kv.Value }
             else { $opt | Add-Member -NotePropertyName $kv.Key -NotePropertyValue $kv.Value }
           }
@@ -968,22 +969,45 @@ jobs:
             exit 0
           }
 
-          $canonical = $env:X_TS_HOSTNAME
-          $waitMax   = [DateTime]::UtcNow.AddMinutes([int]$env:X_OVERLAP + 20)
-          Write-Host ("Waiting for the previous '{0}' to go offline (it is still serving you). Polling every 15 s, up to {1} min." -f `
-            $canonical, ([int]$env:X_OVERLAP + 20)) -ForegroundColor Cyan
+          $canonical  = $env:X_TS_HOSTNAME
+          $waitMax    = [DateTime]::UtcNow.AddMinutes([int]$env:X_OVERLAP + 25)
+          $parentRun  = "$env:X_PARENT_RUN"
+          $headers    = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'rdp'; Accept = 'application/vnd.github+json' }
+          Write-Host ("Waiting for the previous '{0}' to retire (it is still serving you). Polling every 5 s, up to {1} min." -f `
+            $canonical, ([int]$env:X_OVERLAP + 25)) -ForegroundColor Cyan
+          if ($parentRun) { Write-Host "Parent job: $env:X_REPO/actions/runs/$parentRun" }
 
-          $free = $false
+          $free = $false; $parentDone = $false; $graceStart = $null; $polls = 0
           while ([DateTime]::UtcNow -lt $waitMax) {
+            # Signal 1 (fast, exact): the parent job itself has completed.
+            if ($parentRun -and -not $parentDone) {
+              try {
+                $run = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:X_REPO/actions/runs/$parentRun"
+                if ($run.status -eq 'completed') {
+                  $parentDone = $true
+                  $graceStart = [DateTime]::UtcNow
+                  Write-Host "Parent job completed ($($run.conclusion)) - its VM is being destroyed right now." -ForegroundColor Cyan
+                }
+              } catch { }
+            }
+            # Signal 2 (authoritative): the permanent node is actually offline.
             $st = $null
             try { $st = (& $exe status --json) | ConvertFrom-Json } catch { }
             if ($st) {
               $peer = @($st.Peer.PSObject.Properties.Value | Where-Object { $_.HostName -eq $canonical })
-              if ($peer.Count -eq 0)      { Write-Host "No node named '$canonical' in the tailnet - it is free."; $free = $true; break }
-              if (-not $peer[0].Online)   { Write-Host "'$canonical' is offline now - the old machine retired. Claiming it."; $free = $true; break }
-              Write-Host ("  still online ({0}) - your old machine is alive, keeping you connected" -f $peer[0].TailscaleIPs[0])
+              if ($peer.Count -eq 0)    { Write-Host "No node named '$canonical' in the tailnet - it is free."; $free = $true; break }
+              if (-not $peer[0].Online) { Write-Host "'$canonical' is offline - claiming the permanent identity now."; $free = $true; break }
+              if ($parentDone -and (([DateTime]::UtcNow - $graceStart).TotalSeconds -ge 90)) {
+                # The job is long over, the VM is gone, Tailscale's view is just stale.
+                Write-Host 'Parent job finished 90 s ago and Tailscale still reports it online - trusting the API and claiming.' -ForegroundColor Yellow
+                $free = $true; break
+              }
+              $polls++
+              if ($polls % 12 -eq 1) {
+                Write-Host ("  still online ({0}) - your old machine is alive and serving you" -f $peer[0].TailscaleIPs[0])
+              }
             }
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 5
           }
 
           if (-not $free) {
@@ -1090,6 +1114,20 @@ jobs:
             }
           }
           if (Test-Path 'C:\chain\sync-status.txt') { Write-Host (Get-Content 'C:\chain\sync-status.txt' -Raw) }
+
+          # A record that lives inside your synced folder, so the chain's whole
+          # history travels with your data and you can read it from inside the box.
+          $first = @($env:X_PERSIST_PATHS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })[0]
+          if ($first -and (Test-Path $first)) {
+            $hist = Join-Path $first '.vpsmajani-handover.log'
+            $curIp = (& 'C:\Program Files\Tailscale\tailscale.exe' ip -4 2>$null) | Select-Object -First 1
+            Add-Content -Path $hist -Value ("{0} | link #{1} | {2} | {3} | persist={4} | user={5}" -f `
+              (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), ([int]$env:X_DEPTH + 1), $env:X_TS_HOSTNAME, $curIp, `
+              $env:X_PERSIST_MODE, $env:X_RDP_USER)
+            Write-Host "Hand-over history appended to $hist (this file travels with your data)."
+            Write-Host '--- last 5 hand-overs ---'
+            Get-Content $hist -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+          }
 
       # ── 12 · bank the permanent identity ───────────────────────────────────
       - name: 12 · Bank the (encrypted) Tailscale identity
