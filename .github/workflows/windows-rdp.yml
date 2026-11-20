@@ -147,7 +147,7 @@ jobs:
       X_OVERLAP:        ${{ github.event.inputs.overlap || github.event.client_payload.overlap || '15' }}
       X_RENEW:          ${{ github.event.inputs.renew || github.event.client_payload.renew || 'true' }}
       X_HOSTNAME_BASE:  ${{ github.event.inputs.hostname || github.event.client_payload.hostname || 'github-rdp-server' }}
-      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc steam vcredist-all directx' }}
+      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc steam vcredist-all directx blender telegram ollama' }}
       X_PERSIST_MODE_IN: ${{ github.event.inputs.persist_mode || github.event.client_payload.persist_mode || 'auto' }}
       X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace,D:\Programs,D:\Games,C:\Users\NvDAdmin' }}
       X_OPTIONS_RAW:    ${{ github.event.inputs.options || github.event.client_payload.options || '{}' }}
@@ -918,6 +918,18 @@ jobs:
               & choco install -y --no-progress $p
             }
           }
+
+          Step 'User autorun (your own services)'
+          $auto = 'D:\Workspace\autorun.ps1'
+          if (Test-Path $auto) {
+            Write-Host "autorun.ps1 found - launching it detached (output: C:\autorun.log)"
+            $pw = 'C:\Program Files\PowerShell\7\pwsh.exe'
+            if (-not (Test-Path $pw)) { $pw = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
+            Start-Process -FilePath $pw -WindowStyle Hidden `
+              -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', $auto) `
+              -RedirectStandardOutput 'C:\autorun.log' -RedirectStandardError 'C:\autorun.err'
+            Write-Host 'autorun launched - it manages its own retries/waiting for the restore.'
+          } else { Write-Host "no $auto - skipping user autorun" }
 
           Step 'Done'
           Write-Host 'ALL UNLIMITED TWEAKS APPLIED'
