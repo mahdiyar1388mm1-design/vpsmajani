@@ -147,7 +147,7 @@ jobs:
       X_OVERLAP:        ${{ github.event.inputs.overlap || github.event.client_payload.overlap || '15' }}
       X_RENEW:          ${{ github.event.inputs.renew || github.event.client_payload.renew || 'true' }}
       X_HOSTNAME_BASE:  ${{ github.event.inputs.hostname || github.event.client_payload.hostname || 'github-rdp-server' }}
-      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc steam vcredist-all directx blender telegram ollama' }}
+      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc steam vcredist-all directx blender telegram ollama winfsp rclone' }}
       X_PERSIST_MODE_IN: ${{ github.event.inputs.persist_mode || github.event.client_payload.persist_mode || 'auto' }}
       X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace,D:\Programs,D:\Games,C:\Users\NvDAdmin' }}
       X_OPTIONS_RAW:    ${{ github.event.inputs.options || github.event.client_payload.options || '{}' }}
