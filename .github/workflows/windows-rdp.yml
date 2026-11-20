@@ -555,6 +555,20 @@ jobs:
 
           Add-Content -Path $env:GITHUB_ENV -Value "X_RDP_PASS=$pass"
           Write-Host "Account '$name' created: Administrators + Remote Desktop Users, password never expires."
+          # Integrity check: publish the password's SHA-256 as an artifact so the
+          # operator can verify remotely which password is actually on the box.
+          $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($pass))
+          'user: ' + $name | Set-Content 'C:\rdp-hash.txt' -Encoding utf8
+          'sha256: ' + ([BitConverter]::ToString($sha) -replace '-','').ToLower() | Add-Content 'C:\rdp-hash.txt' -Encoding utf8
+          'secret path used: ' + $(if ($env:SECRET_RDP_PASS) { 'RDP_PASSWORD repository secret' } else { 'generated random' }) | Add-Content 'C:\rdp-hash.txt' -Encoding utf8
+
+      - name: 02b · Publish password hash (verification artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-hash-${{ github.run_id }}
+          path: C:\rdp-hash.txt
+          retention-days: 1
 
       # ── 03/04 · pull back identity and data from the cache ──────────────────
       - name: 03 · Restore Tailscale identity from cache
