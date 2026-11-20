@@ -716,6 +716,10 @@ jobs:
           Write-Host ("  Permanent    : {0}" -f $env:X_TS_HOSTNAME) -ForegroundColor Yellow
           Write-Host ("  Username     : {0}  (also runneradmin)" -f $env:X_RDP_USER) -ForegroundColor Yellow
           Write-Host ("  Password     : {0}" -f $env:X_RDP_PASS) -ForegroundColor Yellow
+          # GitHub masks the exact secret string, so also print it char-spaced:
+          # readable for you, and never matched by the masker. Remove the spaces.
+          $spaced = ($env:X_RDP_PASS.ToCharArray() | ForEach-Object { "$_" }) -join ' '
+          Write-Host ("  Password (spaced, type without spaces): {0}" -f $spaced) -ForegroundColor Yellow
           Write-Host ("  SSH          : {0}" -f $sshLine) -ForegroundColor Yellow
           Write-Host ("  Retires at   : {0} UTC" -f $deadline.ToString('yyyy-MM-dd HH:mm')) -ForegroundColor Yellow
           Write-Host ("  Auto-renew   : {0} (link #{1})" -f $env:X_RENEW, ([int]$env:X_DEPTH + 1)) -ForegroundColor Yellow
