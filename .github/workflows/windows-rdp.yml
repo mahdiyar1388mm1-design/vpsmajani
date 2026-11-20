@@ -536,11 +536,23 @@ jobs:
           }
 
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
-          New-LocalUser -Name $name -Password $sec -PasswordNeverExpires -AccountNeverExpires `
-            -FullName 'Cloud RDP Administrator' -Description 'Unlimited cloud RDP admin' | Out-Null
+          # NOTE: Windows complexity policy rejects a password that contains the
+          # account name itself - the secret must never embed the username.
+          $created = $false
+          try {
+            New-LocalUser -Name $name -Password $sec -PasswordNeverExpires -AccountNeverExpires `
+              -FullName 'Cloud RDP Administrator' -Description 'Unlimited cloud RDP admin' -ErrorAction Stop | Out-Null
+            $created = $true
+          } catch {
+            Write-Host "New-LocalUser failed ($($_.Exception.Message.Trim())) - falling back to net user." -ForegroundColor Yellow
+          }
+          if (-not $created) {
+            cmd /c "echo Y| net user $name $pass /add /active:yes" | Out-Null
+          }
           Set-LocalUser -Name $name -PasswordNeverExpires $true
-          Add-LocalGroupMember -Group 'Administrators'       -Member $name
-          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $name
+          net localgroup Administrators $name /add 2>&1 | Out-Null
+          net localgroup 'Remote Desktop Users' $name /add 2>&1 | Out-Null
+          Set-LocalUser -Name $name -PasswordNeverExpires $true
 
           if ($env:X_RESET_RUNNER -eq 'true') {
             net user runneradmin $pass | Out-Null
