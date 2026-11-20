@@ -97,7 +97,7 @@ on:
       persist_paths:
         description: 'Folders to keep, comma separated (D:\Workspace + user profile folders)'
         required: false
-        default: 'D:\Workspace,C:\Users\NvDAdmin'
+        default: 'D:\Workspace,D:\Programs,D:\Games,C:\Users\NvDAdmin'
       options:
         description: 'Advanced JSON - see README. Keys: max_chain, depth, heals, ssh, exit_node, reset_runneradmin, persist_identity, tailscale_args, sync_remote, sync_folder, sync_minutes, persist_exclude'
         required: false
@@ -147,9 +147,9 @@ jobs:
       X_OVERLAP:        ${{ github.event.inputs.overlap || github.event.client_payload.overlap || '15' }}
       X_RENEW:          ${{ github.event.inputs.renew || github.event.client_payload.renew || 'true' }}
       X_HOSTNAME_BASE:  ${{ github.event.inputs.hostname || github.event.client_payload.hostname || 'github-rdp-server' }}
-      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc' }}
+      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc steam vcredist-all directx' }}
       X_PERSIST_MODE_IN: ${{ github.event.inputs.persist_mode || github.event.client_payload.persist_mode || 'auto' }}
-      X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace,C:\Users\NvDAdmin' }}
+      X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace,D:\Programs,D:\Games,C:\Users\NvDAdmin' }}
       X_OPTIONS_RAW:    ${{ github.event.inputs.options || github.event.client_payload.options || '{}' }}
       X_RDP_USER:       NvDAdmin
       X_WORKFLOW_FILE:  windows-rdp.yml
