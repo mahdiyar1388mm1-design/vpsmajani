@@ -114,7 +114,7 @@ on:
   #   - cron: '0 */6 * * *'
 
 permissions:
-  contents: read
+  contents: write         # the data bank mirrors bundles to release assets
   actions: write          # the chain dispatches its own next link
 
 jobs:
@@ -362,6 +362,111 @@ jobs:
           '@ | Set-Content -Path 'C:\chain\renew.ps1' -Encoding utf8
           Write-Host 'Chain helper written to C:\chain\renew.ps1'
 
+          # The data bank: the encrypted bundle is mirrored to release assets every
+          # sync cycle, so a mid-job machine death loses at most one cycle of data,
+          # never the whole session. Restore prefers whichever copy is newest.
+          Set-Content -Path 'C:\chain\repo.txt'  -Value $env:X_REPO  -Encoding utf8
+          Set-Content -Path 'C:\chain\gh.token' -Value $env:GH_TOKEN -Encoding utf8
+          @'
+          param([switch]$Push,[switch]$Fetch)
+          $ErrorActionPreference = 'Continue'
+          $repo  = ((Get-Content 'C:\chain\repo.txt'  -Raw -ErrorAction SilentlyContinue) -split "`r?`n")[0].Trim()
+          $tok   = ((Get-Content 'C:\chain\gh.token' -Raw -ErrorAction SilentlyContinue) -split "`r?`n")[0].Trim()
+          $tag   = 'data-bank'
+          $stage = 'C:\persist-cache'
+          if (-not $repo -or -not $tok) { Write-Host '[bank] missing repo/token - abort'; exit 0 }
+          $headers = @{ Authorization = "Bearer $tok"; 'User-Agent' = 'rdp-bank'; Accept = 'application/vnd.github+json' }
+          function Log($m) { Write-Host ("[bank {0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }
+          function Get-BankRelease {
+            try { return Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" }
+            catch {
+              if ("$($_.Exception.Response.StatusCode)" -eq '404') {
+                try { return Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' -Body '{"tag_name":"data-bank","name":"data-bank"}' -Uri "https://api.github.com/repos/$repo/releases" }
+                catch { Log "could not create the bank release: $($_.Exception.Message)"; return $null }
+              }
+              Log "release lookup failed: $($_.Exception.Message)"; return $null
+            }
+          }
+          function Split-IfNeeded([string]$path) {
+            $fi = Get-Item $path
+            if ($fi.Length -lt 1900MB) { return @($path) }
+            $parts = @(); $i = 0; $chunk = 512MB
+            $fs = [IO.File]::OpenRead($path)
+            try {
+              $buf = New-Object byte[] $chunk
+              while ($fs.Position -lt $fs.Length) {
+                $i++; $n = $fs.Read($buf, 0, $buf.Length)
+                $p = '{0}.part{1:d2}' -f $path, $i
+                [IO.File]::WriteAllBytes($p, $buf[0..($n-1)])
+                $parts += $p
+              }
+            } finally { $fs.Close() }
+            Remove-Item $path -Force
+            return $parts
+          }
+          function Newest-BankTime($rel) {
+            $new = $null
+            foreach ($a in @($rel.assets)) {
+              $t = ([datetimeoffset]$a.updated_at).UtcDateTime
+              if (-not $new -or $t -gt $new) { $new = $t }
+            }
+            return $new
+          }
+          function Newest-LocalTime {
+            $f = Get-ChildItem -Path $stage -Filter '*.tar.enc*' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+            if ($f) { return $f.LastWriteTimeUtc }
+            return $null
+          }
+          if ($Push) {
+            & C:\chain\sync-once.ps1 -Direction backup | Out-Null
+            if ($LASTEXITCODE -ne 0) { Log "backup failed (exit $LASTEXITCODE) - not banking"; exit 0 }
+            $rel = Get-BankRelease
+            if (-not $rel) { exit 0 }
+            foreach ($a in @($rel.assets)) {
+              try { Invoke-RestMethod -Method Delete -Headers $headers -Uri "https://api.github.com/repos/$repo/releases/assets/$($a.id)" | Out-Null } catch {}
+            }
+            foreach ($f in (Get-ChildItem -Path $stage -Filter '*.tar.enc' -File)) {
+              foreach ($p in (Split-IfNeeded $f.FullName)) {
+                $name = [IO.Path]::GetFileName($p)
+                try {
+                  Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/octet-stream' -InFile $p `
+                    -Uri "https://uploads.github.com/repos/$repo/releases/$($rel.id)/assets?name=$name" | Out-Null
+                  Log "banked $name"
+                } catch { Log "bank upload failed for $name : $($_.Exception.Message)" }
+              }
+            }
+            'banked' | Set-Content 'C:\chain\bank.ok'
+            exit 0
+          }
+          if ($Fetch) {
+            $rel = Get-BankRelease
+            if (-not $rel) { Log 'no bank release yet'; exit 0 }
+            if (-not @($rel.assets).Count) { Log 'bank is empty (first session)'; exit 0 }
+            $bt = Newest-BankTime $rel
+            $lt = Newest-LocalTime
+            if ($bt -and $lt -and ($bt -lt $lt.AddSeconds(30))) { Log "local bundle ($lt) is newer than the bank ($bt) - keeping local"; exit 0 }
+            Log "bank is newer ($bt) - fetching $($rel.assets.Count) asset(s)..."
+            Remove-Item "$stage\*" -Force -ErrorAction SilentlyContinue
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add('Authorization', "Bearer $tok")
+            $wc.Headers.Add('User-Agent', 'rdp-bank')
+            foreach ($a in @($rel.assets)) {
+              try { $wc.DownloadFile($a.browser_download_url, (Join-Path $stage $a.name)); Log "fetched $($a.name)" }
+              catch { Log "fetch failed for $($a.name) : $($_.Exception.Message)" }
+            }
+            foreach ($grp in (Get-ChildItem -Path $stage -Filter '*.part*' -File | Group-Object { $_.Name -replace '\\.part\\d+$','' })) {
+              $base = Join-Path $stage $grp.Name
+              $os = [IO.File]::Create($base)
+              try { foreach ($p in ($grp.Group | Sort-Object Name)) { $b = [IO.File]::ReadAllBytes($p.FullName); $os.Write($b, 0, $b.Length); $b = $null } }
+              finally { $os.Close() }
+            }
+            Get-ChildItem -Path $stage -Filter '*.part*' -File | Remove-Item -Force
+            Log 'bank fetch complete'
+            exit 0
+          }
+          '@ | Set-Content -Path 'C:\chain\bank.ps1' -Encoding utf8
+          Write-Host 'Data bank helper written to C:\chain\bank.ps1'
+
       # ── 01 · RDP with no session limits ─────────────────────────────────────
       - name: 01 · Remote Desktop - unlimited sessions, never disconnect
         run: |
@@ -470,6 +575,14 @@ jobs:
           key: data-${{ steps.boot.outputs.hostname }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: data-${{ steps.boot.outputs.hostname }}-
           fail-on-cache-miss: false
+
+      - name: 04b · Fetch the newer copy from the data bank if there is one
+        if: steps.boot.outputs.persist_mode == 'cache'
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          if (Test-Path 'C:\chain\bank.ps1') { & C:\chain\bank.ps1 -Fetch }
 
       # ── 05 · tailscale: reachable from here on ──────────────────────────────
       - name: 05 · Install Tailscale and join the tailnet
@@ -764,6 +877,7 @@ jobs:
           Write-Host "sync loop started, every $mins minute(s)"
           while (-not (Test-Path 'C:\chain\stop-sync')) {
             & C:\chain\sync-once.ps1 -Direction backup
+            if ($cfg.mode -ne 'drive') { & C:\chain\bank.ps1 -Push }
             for ($i = 0; $i -lt ($mins * 6); $i++) {
               if (Test-Path 'C:\chain\stop-sync') { break }
               Start-Sleep -Seconds 10
@@ -955,7 +1069,7 @@ jobs:
 
       # ── 09 · periodic sync (drive mode) ────────────────────────────────────
       - name: 09 · Start the periodic sync loop (every N minutes)
-        if: steps.boot.outputs.persist_mode == 'drive'
+        if: steps.boot.outputs.persist_mode != 'none'
         run: |
           $ErrorActionPreference = 'Continue'
           $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
@@ -1107,6 +1221,8 @@ jobs:
                 Write-Host 'No newer bundle found; unpacking the one restored at boot.'
               }
             }
+            Write-Host 'Also checking the data bank for a newer bundle...'
+            if (Test-Path 'C:\chain\bank.ps1') { & C:\chain\bank.ps1 -Fetch }
             Write-Host 'Unpacking the encrypted data bundle...'
             & C:\chain\sync-once.ps1 -Direction restore
             if ($LASTEXITCODE -eq 0 -and (Get-ChildItem 'C:\persist-cache' -Filter '*.tar.enc' -ErrorAction SilentlyContinue)) {
@@ -1331,6 +1447,11 @@ jobs:
               fi
             done
           done
+          echo
+          echo "Disabling the watchdog so the chain does not come back on its own..."
+          gh api -X PUT "repos/$GH_REPO/actions/variables/RDP_WATCHDOG" -f name=RDP_WATCHDOG -f value=off >/dev/null 2>&1 \
+            && echo "  watchdog OFF (run the RDP watchdog workflow with action=on to re-enable)" \
+            || echo "  could not write RDP_WATCHDOG - set the repository variable RDP_WATCHDOG=off manually"
           echo
           echo "Running machines are gone. To make sure no chain link comes back:"
           echo "  * create a file named STOP-RDP at the repository root, or"

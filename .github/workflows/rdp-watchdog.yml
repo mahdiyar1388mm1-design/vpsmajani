@@ -1,0 +1,58 @@
+name: RDP watchdog
+
+# Revives the RDP chain automatically if every machine died unexpectedly.
+# Controls:
+#   * run this workflow with action=on  -> auto-revive enabled (writes RDP_WATCHDOG=on)
+#   * run this workflow with action=off -> auto-revive disabled (writes RDP_WATCHDOG=off)
+#   * the RDP workflow's "Emergency stop" job turns it off automatically
+#   * cron workflows are disabled by GitHub after ~60 days without repo commits
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'on = revive dead chains, off = stop reviving, status = just report'
+        required: false
+        default: 'status'
+        type: choice
+        options:
+          - status
+          - on
+          - off
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Watch the chain, revive it if it dies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:  ${{ github.repository }}
+        run: |
+          act="${{ github.event.inputs.action || 'status' }}"
+          if [ "$act" = "on" ] || [ "$act" = "off" ]; then
+            gh api -X PUT "repos/$GH_REPO/actions/variables/RDP_WATCHDOG" \
+              -f name=RDP_WATCHDOG -f value="$act" >/dev/null 2>&1 \
+              && echo "watchdog is now: $act" \
+              || echo "could not write the RDP_WATCHDOG variable - check repo Actions permissions"
+            exit 0
+          fi
+          state=$(gh api "repos/$GH_REPO/actions/variables/RDP_WATCHDOG" --jq .value 2>/dev/null || echo "")
+          if [ "$state" != "on" ]; then echo "watchdog is '${state:-unset}' (off) - nothing to do"; exit 0; fi
+          active=$(gh api "repos/$GH_REPO/actions/workflows/windows-rdp.yml/runs?per_page=10" \
+            --jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued")] | length' 2>/dev/null || echo "?")
+          if [ "$active" != "0" ]; then echo "chain alive ($active active run(s)) - nothing to do"; exit 0; fi
+          echo "chain is dead - dispatching a fresh machine..."
+          if gh api -X POST "repos/$GH_REPO/actions/workflows/windows-rdp.yml/dispatches" -f ref=main >/dev/null 2>&1; then
+            echo "revived: a new machine is booting with your data from the bank"
+          else
+            echo "dispatch failed - check the workflow file and permissions"
+            exit 1
+          fi
