@@ -920,7 +920,7 @@ jobs:
           }
 
           Step 'User autorun (your own services)'
-          $auto = 'D:\Workspace\autorun.ps1'
+          $auto = 'D:\Disk\autorun.ps1'
           if (Test-Path $auto) {
             Write-Host "autorun.ps1 found - launching it detached (output: C:\autorun.log)"
             $pw = 'C:\Program Files\PowerShell\7\pwsh.exe'
