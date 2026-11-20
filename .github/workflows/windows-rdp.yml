@@ -1,56 +1,1326 @@
-name: Windows Cloud RDP
+name: Windows Cloud RDP · Unlimited
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  A Windows cloud machine on GitHub's runners, reachable over Tailscale, with
+#  every software limit pushed as far as the platform physically allows:
+#
+#    TIME      → each job uses the full 360 min platform cap and then hands over
+#                to a replacement it spawned itself. Endless chain.
+#    NO GAP    → the replacement boots WHILE the old machine is still alive, on a
+#                temporary Tailscale identity, restores your data, and only then
+#                reclaims the permanent address - the moment the old node goes
+#                offline. Nothing running is ever cut off early.
+#    DATA      → your folders survive the machine: rclone sync to Google Drive
+#                (or any rclone remote) every N minutes + one final sync before
+#                retirement, or - with zero setup - an AES-256 encrypted bundle
+#                in the Actions cache.
+#    IDENTITY  → the Tailscale node state is AES-256 encrypted and cached, so the
+#                permanent IP and MagicDNS name never change.
+#    SCALE     → up to 20 parallel machines, runner labels up to 64 cores.
+#    OS/RDP    → no sleep, unbounded pagefile, no network throttling, no forced
+#                updates, unlimited RDP sessions, no idle or disconnect timers.
+#    BRAKE     → STOP-RDP file, RDP_CHAIN_ENABLED=false, or rdp-stop dispatch.
+#
+#  CEILINGS THAT NO YAML CAN MOVE (GitHub-hosted runners):
+#    · a job is killed at 6 hours, period
+#    · the VM and its disks are destroyed with it - RAM and running programs
+#      cannot survive, only FILES can (that is what the persistence layer is for)
+#    · 20 concurrent jobs on the Free plan
+#  Want one machine that is literally never turned off? Run this same workflow on
+#  a self-hosted runner: duration up to 4320 min (72 h) per job, your own disk,
+#  nothing to migrate. See README.
+#
+#  NOTE: workflow_dispatch only works once this file is on your DEFAULT branch.
+#  NOTE: workflow_dispatch allows at most 10 inputs, so all advanced settings
+#        live in one JSON input called `options`.
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
+    inputs:
+      instances:
+        description: 'Machines to launch at once (JSON array of slot IDs)'
+        required: false
+        default: '[1]'
+        type: choice
+        options:
+          - '[1]'
+          - '[1,2]'
+          - '[1,2,3]'
+          - '[1,2,3,4]'
+          - '[1,2,3,4,5,6]'
+          - '[1,2,3,4,5,6,7,8]'
+          - '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]'
+          - '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]'
+      runner:
+        description: 'Runner label (bigger ones must be enabled in repo Settings - Actions - Runners)'
+        required: false
+        default: 'windows-latest'
+        type: choice
+        options:
+          - windows-latest
+          - windows-2025
+          - windows-2022
+          - windows-latest-8-cores
+          - windows-latest-16-cores
+          - windows-latest-32-cores
+          - windows-latest-64-cores
+          - self-hosted
+      duration:
+        description: 'Minutes each machine stays alive (GitHub-hosted cap 360, self-hosted 4320)'
+        required: false
+        default: '360'
+      overlap:
+        description: 'Minutes before retirement to boot the replacement (bigger = safer hand-over)'
+        required: false
+        default: '15'
+      renew:
+        description: 'Auto-renew forever (infinite chain)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      hostname:
+        description: 'Permanent Tailscale hostname - this is the address you pin'
+        required: false
+        default: 'github-rdp-server'
+      packages:
+        description: 'Chocolatey packages, space separated ("none" to skip)'
+        required: false
+        default: 'googlechrome firefox 7zip git python nodejs-lts vscode vlc'
+      persist_mode:
+        description: 'Keep your files across machines (auto = Drive if RCLONE_CONF secret exists, else encrypted cache)'
+        required: false
+        default: 'auto'
+        type: choice
+        options: ['auto', 'drive', 'cache', 'none']
+      persist_paths:
+        description: 'Folders to keep, comma separated (e.g. D:\Workspace,C:\Users\NvDAdmin\Desktop)'
+        required: false
+        default: 'D:\Workspace'
+      options:
+        description: 'Advanced JSON - see README. Keys: max_chain, depth, heals, ssh, exit_node, reset_runneradmin, persist_identity, tailscale_args, sync_remote, sync_folder, sync_minutes, persist_exclude'
+        required: false
+        default: '{}'
+
+  repository_dispatch:
+    # start : gh api repos/OWNER/REPO/dispatches -f event_type=rdp-start
+    # stop  : gh api repos/OWNER/REPO/dispatches -f event_type=rdp-stop
+    types: [rdp-start, rdp-renew, rdp-stop]
+
+  # Optional safety net: uncomment to have GitHub re-launch a machine every 6 h
+  # even if a whole chain ever dies (costs runner minutes on every tick).
+  # schedule:
+  #   - cron: '0 */6 * * *'
+
+permissions:
+  contents: read
+  actions: write          # the chain dispatches its own next link
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 360
+  # ───────────────────────────────────────────────────────────────────────────
+  #  The machine
+  # ───────────────────────────────────────────────────────────────────────────
+  rdp:
+    if: github.event.action != 'rdp-stop'
+    name: 'RDP node ${{ matrix.instance }}'
+    runs-on: ${{ github.event.inputs.runner || github.event.client_payload.runner || 'windows-latest' }}
+    timeout-minutes: ${{ fromJson(github.event.inputs.duration || github.event.client_payload.duration || '360') }}
+
+    # Deliberately NO concurrency group: the replacement must be allowed to boot
+    # while its parent is still alive, that is the whole zero-gap hand-over.
+
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: ${{ fromJson(github.event.inputs.instances || github.event.client_payload.instances || '[1]') }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      X_SLOT:           ${{ matrix.instance }}
+      X_SLOTS_JSON:     ${{ github.event.inputs.instances || github.event.client_payload.instances || '[1]' }}
+      X_RUNNER_LABEL:   ${{ github.event.inputs.runner || github.event.client_payload.runner || 'windows-latest' }}
+      X_DURATION:       ${{ github.event.inputs.duration || github.event.client_payload.duration || '360' }}
+      X_OVERLAP:        ${{ github.event.inputs.overlap || github.event.client_payload.overlap || '15' }}
+      X_RENEW:          ${{ github.event.inputs.renew || github.event.client_payload.renew || 'true' }}
+      X_HOSTNAME_BASE:  ${{ github.event.inputs.hostname || github.event.client_payload.hostname || 'github-rdp-server' }}
+      X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc' }}
+      X_PERSIST_MODE_IN: ${{ github.event.inputs.persist_mode || github.event.client_payload.persist_mode || 'auto' }}
+      X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace' }}
+      X_OPTIONS_RAW:    ${{ github.event.inputs.options || github.event.client_payload.options || '{}' }}
+      X_RDP_USER:       NvDAdmin
+      X_WORKFLOW_FILE:  windows-rdp.yml
+      X_REPO:           ${{ github.repository }}
+      X_MAX_HEALS:      '3'
+      X_CHAIN_FLAG_VAR: ${{ vars.RDP_CHAIN_ENABLED }}
+      GH_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      SECRET_RDP_PASS:  ${{ secrets.RDP_PASSWORD }}
+      RCLONE_CONF:      ${{ secrets.RCLONE_CONF }}
+      # AES-256 key material for the cached identity and the cached data bundle.
+      # A public repo's Actions cache is readable by a fork's pull-request token,
+      # so nothing sensitive is ever stored there in the clear.
+      IDENTITY_KEY:     ${{ secrets.TAILSCALE_IDENTITY_KEY || secrets.TAILSCALE_AUTHKEY }}
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      # ── 00 · clock, hardware, resolve every setting, chain helper ───────────
+      - name: 00 · Boot, resolve settings, write the chain helper
+        id: boot
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          $ErrorActionPreference = 'SilentlyContinue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "X_JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
 
-      - name: 2. Create Admin Account
-        run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
-
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 4. Keep Server Alive (48 Hours)
-        run: |
-          for ($i = 1; $i -le 2880; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/2880] Server running..."
+          # ---- one place resolves the `options` JSON so the rest only reads env ----
+          $opt = $null
+          try { if ($env:X_OPTIONS_RAW) { $opt = $env:X_OPTIONS_RAW | ConvertFrom-Json } } catch { Write-Host "options JSON could not be parsed ($($_.Exception.Message)); falling back to defaults." }
+          function Get-Opt([string]$name, $default) {
+            if ($opt -and $null -ne $opt.PSObject.Properties[$name] -and $null -ne $opt.$name) { return $opt.$name }
+            return $default
           }
+          function Get-Flag([string]$name, [bool]$default) {
+            $v = Get-Opt $name $default
+            if ($v -is [bool]) { return $(if ($v) { 'true' } else { 'false' }) }
+            return "$v".ToLowerInvariant()
+          }
+
+          $slots     = $env:X_SLOTS_JSON | ConvertFrom-Json
+          $host_name = if ($slots.Count -gt 1) { '{0}-{1}' -f $env:X_HOSTNAME_BASE, $env:X_SLOT } else { $env:X_HOSTNAME_BASE }
+          $modeIn    = "$env:X_PERSIST_MODE_IN".ToLowerInvariant()
+          $mode = switch ($modeIn) {
+                     'drive' { 'drive' }
+                     'cache' { 'cache' }
+                     'none'  { 'none' }
+                     default { if ($env:RCLONE_CONF) { 'drive' } else { 'cache' } }
+                   }
+          # `drive` without the rclone config secret cannot work - fall back here so
+          # that steps.boot.outputs.persist_mode is final for every later `if:`.
+          if ($mode -eq 'drive' -and -not $env:RCLONE_CONF) {
+            Write-Host 'persist_mode=drive but the RCLONE_CONF secret is empty - using cache mode instead.' -ForegroundColor Yellow
+            $mode = 'cache'
+          }
+
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_TS_HOSTNAME=$host_name"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "hostname=$host_name"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "persist_mode=$mode"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_MODE=$mode"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_DEPTH=$([int](Get-Opt 'depth' 0))"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_PARENT_RUN=$(Get-Opt 'parent_run' '')"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_HEALS=$([int](Get-Opt 'heals' 0))"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_MAX_CHAIN=$([int](Get-Opt 'max_chain' 0))"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_SSH=$(Get-Flag 'ssh' $true)"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_EXIT_NODE=$(Get-Flag 'exit_node' $false)"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_RESET_RUNNER=$(Get-Flag 'reset_runneradmin' $true)"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_IDENTITY=$(Get-Flag 'persist_identity' $true)"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_TS_ARGS=$(Get-Opt 'tailscale_args' '')"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_SYNC_REMOTE=$(Get-Opt 'sync_remote' 'gdrive')"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_SYNC_FOLDER=$(Get-Opt 'sync_folder' 'vpsmajani')"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_SYNC_MINUTES=$([int](Get-Opt 'sync_minutes' 10))"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_EXCLUDE=$(Get-Opt 'persist_exclude' '$RECYCLE.BIN/**,*/AppData/Local/Temp/**,*.tmp,pagefile.sys,hiberfil.sys')"
+
+          Write-Host "Tailscale identity : $host_name (slot $env:X_SLOT of $($slots.Count))"
+          Write-Host "Chain link         : #$([int](Get-Opt 'depth' 0) + 1), heals $([int](Get-Opt 'heals' 0))/$env:X_MAX_HEALS"
+          Write-Host "Persistence        : $mode  paths=$env:X_PERSIST_PATHS  every $([int](Get-Opt 'sync_minutes' 10)) min"
+
+          Write-Host '=== HARDWARE ===' -ForegroundColor Cyan
+          $os  = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host ("OS   : {0}" -f $os.Caption)
+          Write-Host ("CPU  : {0} logical cores - {1}" -f $cpu.NumberOfLogicalProcessors, $cpu.Name.Trim())
+          Write-Host ("RAM  : {0} GB" -f [math]::Round($os.TotalVisibleMemorySize / 1MB, 1))
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+            Write-Host ("Disk {0}: {1} GB total, {2} GB free" -f $_.DeviceID, `
+              [math]::Round($_.Size / 1GB, 1), [math]::Round($_.FreeSpace / 1GB, 1))
+          }
+
+          # The chain can only be dispatched against the default branch.
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'rdp'; Accept = 'application/vnd.github+json' }
+          $repoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:X_REPO" -Headers $headers
+          Add-Content -Path $env:GITHUB_ENV -Value "X_DEFAULT_BRANCH=$($repoInfo.default_branch)"
+          Write-Host ("Default branch: {0} | private repo: {1}" -f $repoInfo.default_branch, $repoInfo.private)
+
+          # Heads-up if more than one fleet is alive (each Run workflow click adds one).
+          try {
+            $live = Invoke-RestMethod -Headers $headers `
+              -Uri "https://api.github.com/repos/$env:X_REPO/actions/runs?event=workflow_dispatch&status=in_progress&per_page=20"
+            $same = @($live.workflow_runs | Where-Object { $_.name -like 'Windows Cloud RDP*' -and $_.id -ne [int64]$env:GITHUB_RUN_ID })
+            if ($same.Count -gt 0) {
+              Write-Host ("Note: {0} other RDP run(s) are in progress. Overlap is by design; use the rdp-stop dispatch to clear them all." -f $same.Count) -ForegroundColor Yellow
+            }
+          } catch { }
+
+          # One helper owns every renewal decision, so the normal hand-over and the
+          # crash self-heal can never disagree. Exit codes: 0 dispatched,
+          # 1 dispatch failed (caller retries), 2 deliberately not chaining.
+          New-Item -ItemType Directory -Path 'C:\chain' -Force | Out-Null
+          @'
+          param([switch]$SelfHeal)
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference    = 'SilentlyContinue'
+
+          $headers  = @{
+            Authorization          = "Bearer $env:GH_TOKEN"
+            'User-Agent'           = 'rdp-chain'
+            Accept                 = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $depth    = [int]$env:X_DEPTH
+          $maxChain = [int]$env:X_MAX_CHAIN
+          $heals    = [int]$env:X_HEALS
+          $maxHeals = [int]$env:X_MAX_HEALS
+
+          function Add-Summary([string]$text) {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $text -ErrorAction SilentlyContinue
+          }
+
+          if ($env:X_RENEW -ne 'true') {
+            Write-Host 'Auto-renew is off (renew=false). The chain ends with this machine.'
+            exit 2
+          }
+          # In fleet mode the payload re-creates every slot, so only the lead slot
+          # dispatches. Otherwise each slot would spawn a duplicate fleet.
+          $slots = $env:X_SLOTS_JSON | ConvertFrom-Json
+          if ("$($slots[0])" -ne "$env:X_SLOT") {
+            Write-Host "Slot $env:X_SLOT is not the lead slot; slot $($slots[0]) renews the whole fleet."
+            exit 2
+          }
+          if ($env:X_CHAIN_FLAG_VAR -eq 'false' -or $env:X_CHAIN_FLAG_VAR -eq 'stop') {
+            Write-Host "Chain disabled by repository variable RDP_CHAIN_ENABLED=$($env:X_CHAIN_FLAG_VAR)."
+            Add-Summary "`nChain stopped: repository variable ``RDP_CHAIN_ENABLED=$($env:X_CHAIN_FLAG_VAR)``.`n"
+            exit 2
+          }
+          try {
+            $null = Invoke-RestMethod -Headers $headers `
+              -Uri "https://api.github.com/repos/$env:X_REPO/contents/STOP-RDP?ref=$env:X_DEFAULT_BRANCH"
+            Write-Host "Chain stopped: marker file STOP-RDP exists on '$env:X_DEFAULT_BRANCH'."
+            Add-Summary "`nChain stopped: marker file ``STOP-RDP`` exists on ``$env:X_DEFAULT_BRANCH``.`n"
+            exit 2
+          } catch { }
+          if ($maxChain -gt 0 -and ($depth + 1) -ge $maxChain) {
+            Write-Host "Chain limit reached: $($depth + 1) of $maxChain links."
+            Add-Summary "`nChain limit reached after $($depth + 1) link(s).`n"
+            exit 2
+          }
+          if ($SelfHeal) {
+            if (-not $env:X_TS_IP4) {
+              Write-Host 'This machine never reached the tailnet, so the next one would fail the same way.'
+              Write-Host 'Refusing to chain. Fix the run, then start it again.'
+              exit 2
+            }
+            if ($heals -ge $maxHeals) {
+              Write-Host "Circuit breaker: $heals consecutive self-heals already (max $maxHeals). Halting on purpose."
+              Add-Summary "`nCircuit breaker tripped after $heals self-heals - chain halted.`n"
+              exit 2
+            }
+          }
+
+          $nextHeals = if ($SelfHeal) { $heals + 1 } else { 0 }
+
+          # Carry the advanced settings forward, with the chain counters updated.
+          $opt = $null
+          try { $opt = $env:X_OPTIONS_RAW | ConvertFrom-Json } catch { }
+          if (-not $opt) { $opt = [pscustomobject]@{} }
+          foreach ($kv in @{ depth = $depth + 1; heals = $nextHeals; parent_run = "$env:GITHUB_RUN_ID" }.GetEnumerator()) {
+            if ($opt.PSObject.Properties[$kv.Key]) { $opt.($kv.Key) = $kv.Value }
+            else { $opt | Add-Member -NotePropertyName $kv.Key -NotePropertyValue $kv.Value }
+          }
+          $optJson = $opt | ConvertTo-Json -Depth 6 -Compress
+
+          $payload = @{
+            ref    = $env:X_DEFAULT_BRANCH
+            inputs = @{
+              instances      = $env:X_SLOTS_JSON
+              runner         = $env:X_RUNNER_LABEL
+              duration       = $env:X_DURATION
+              overlap        = $env:X_OVERLAP
+              renew          = 'true'
+              hostname       = $env:X_HOSTNAME_BASE
+              packages       = $env:X_PACKAGES
+              persist_mode   = $env:X_PERSIST_MODE
+              persist_paths  = $env:X_PERSIST_PATHS
+              options        = $optJson
+            }
+          } | ConvertTo-Json -Depth 5
+
+          try {
+            Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' -Body $payload `
+              -Uri "https://api.github.com/repos/$env:X_REPO/actions/workflows/$env:X_WORKFLOW_FILE/dispatches" | Out-Null
+          } catch {
+            Write-Host "Could not dispatch the next link: $($_.Exception.Message)"
+            Write-Host "workflow_dispatch only works when $env:X_WORKFLOW_FILE exists on the DEFAULT branch ('$env:X_DEFAULT_BRANCH')."
+            exit 1
+          }
+
+          $why = if ($SelfHeal) { "self-heal #$nextHeals" } else { 'hand-over' }
+          Write-Host "Link #$($depth + 1) dispatched ($why) on '$env:X_DEFAULT_BRANCH'."
+          Write-Host 'It boots immediately, on a temporary address, and takes over the permanent one when this machine retires.'
+          Add-Summary "`nReplacement dispatched ($why): link #$($depth + 1). It is already online and restores your data before this machine retires.`n"
+          exit 0
+          '@ | Set-Content -Path 'C:\chain\renew.ps1' -Encoding utf8
+          Write-Host 'Chain helper written to C:\chain\renew.ps1'
+
+      # ── 01 · RDP with no session limits ─────────────────────────────────────
+      - name: 01 · Remote Desktop - unlimited sessions, never disconnect
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ts  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $ws  = "$ts\WinStations\RDP-Tcp"
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $pol -Force | Out-Null
+
+          Set-ItemProperty -Path $ts  -Name 'fDenyTSConnections' -Value 0 -Type DWord
+          Set-ItemProperty -Path $pol -Name 'fDenyTSConnections' -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts  -Name 'fAllowToGetHelp'    -Value 1 -Type DWord
+
+          # Unlimited sessions: no per-user single-session lock, no instance cap
+          Set-ItemProperty -Path $ts  -Name 'fSingleSessionPerUser' -Value 0          -Type DWord
+          Set-ItemProperty -Path $pol -Name 'fSingleSessionPerUser' -Value 0          -Type DWord
+          Set-ItemProperty -Path $ws  -Name 'MaxInstanceCount'      -Value 0xffffffff -Type DWord
+          Set-ItemProperty -Path $pol -Name 'MaxInstanceCount'      -Value 0xffffffff -Type DWord
+
+          # Never drop a session: 0 = no idle limit, no forced disconnect
+          Set-ItemProperty -Path $ws  -Name 'MaxIdleTime'          -Value 0 -Type DWord
+          Set-ItemProperty -Path $ws  -Name 'MaxDisconnectionTime' -Value 0 -Type DWord
+          Set-ItemProperty -Path $ws  -Name 'fResetBroken'         -Value 0 -Type DWord
+          Set-ItemProperty -Path $pol -Name 'MaxIdleTime'          -Value 0 -Type DWord
+          Set-ItemProperty -Path $pol -Name 'MaxDisconnectionTime' -Value 0 -Type DWord
+
+          # Client compatibility: NLA optional, RDP security layer accepted
+          Set-ItemProperty -Path $ws -Name 'UserAuthentication' -Value 0 -Type DWord
+          Set-ItemProperty -Path $ws -Name 'SecurityLayer'      -Value 1 -Type DWord
+          Set-ItemProperty -Path $ws -Name 'fEnableWinStation'  -Value 1 -Type DWord
+          Set-ItemProperty -Path $ws -Name 'MinEncryptionLevel' -Value 2 -Type DWord
+
+          # Keep-alive every 60 s so NAT/VPN never idles the session out
+          Set-ItemProperty -Path $pol -Name 'KeepAliveEnable'      -Value 1     -Type DWord
+          Set-ItemProperty -Path $pol -Name 'KeepAliveInterval'    -Value 60000 -Type DWord
+          Set-ItemProperty -Path $pol -Name 'SelectTransport'      -Value 0     -Type DWord  # TCP + UDP
+          Set-ItemProperty -Path $pol -Name 'bEnumerateHWBeforeSW' -Value 1     -Type DWord
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -Profile Any -Enabled True
+
+          # Make sure the service is up, but never restart it: a restart can tear
+          # down the session this very job is running in.
+          Set-Service TermService -StartupType Automatic
+          if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
+          Write-Host 'RDP is open. Sessions now:'
+          qwinsta
+
+      # ── 02 · accounts ───────────────────────────────────────────────────────
+      - name: 02 · Create admin account (random strong password unless a secret is set)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $name = $env:X_RDP_USER
+
+          if ($env:SECRET_RDP_PASS) {
+            $pass = $env:SECRET_RDP_PASS
+            Write-Host 'Using the RDP_PASSWORD repository secret (masked in the log).'
+          } else {
+            $lower  = 'abcdefghijkmnpqrstuvwxyz'
+            $upper  = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+            $digits = '23456789'
+            $sym    = '!#$%^*-_=+'
+            $pick   = { param($set) $set[(Get-Random -Maximum $set.Length)] }
+            $body   = -join (1..18 | ForEach-Object { & $pick ($lower + $upper + $digits) })
+            $pass   = (& $pick $upper) + $body + (& $pick $sym) + (Get-Random -Minimum 10 -Maximum 99)
+            Write-Host 'Generated a fresh one-time password for this machine.'
+          }
+
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          New-LocalUser -Name $name -Password $sec -PasswordNeverExpires -AccountNeverExpires `
+            -FullName 'Cloud RDP Administrator' -Description 'Unlimited cloud RDP admin' | Out-Null
+          Set-LocalUser -Name $name -PasswordNeverExpires $true
+          Add-LocalGroupMember -Group 'Administrators'       -Member $name
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $name
+
+          if ($env:X_RESET_RUNNER -eq 'true') {
+            net user runneradmin $pass | Out-Null
+            Write-Host "runneradmin now shares the same password as $name."
+          }
+
+          Set-Content -Path 'C:\RDP-CREDENTIALS.txt' -Value @"
+          Username : $name   (also valid: runneradmin)
+          Password : $pass
+          Written  : $([DateTime]::UtcNow.ToString('u'))
+          "@
+
+          Add-Content -Path $env:GITHUB_ENV -Value "X_RDP_PASS=$pass"
+          Write-Host "Account '$name' created: Administrators + Remote Desktop Users, password never expires."
+
+      # ── 03/04 · pull back identity and data from the cache ──────────────────
+      - name: 03 · Restore Tailscale identity from cache
+        id: ts_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\ts-state
+          key: tsid-${{ steps.boot.outputs.hostname }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: tsid-${{ steps.boot.outputs.hostname }}-
+          fail-on-cache-miss: false
+
+      - name: 04 · Restore data bundle from cache (cache mode)
+        if: steps.boot.outputs.persist_mode == 'cache'
+        id: data_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\persist-cache
+          key: data-${{ steps.boot.outputs.hostname }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: data-${{ steps.boot.outputs.hostname }}-
+          fail-on-cache-miss: false
+
+      # ── 05 · tailscale: reachable from here on ──────────────────────────────
+      - name: 05 · Install Tailscale and join the tailnet
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
+          $canonical = $env:X_TS_HOSTNAME
+          $tempName  = '{0}-r{1}' -f $canonical, $env:GITHUB_RUN_NUMBER
+          $exe       = 'C:\Program Files\Tailscale\tailscale.exe'
+          $dataDir   = 'C:\ProgramData\Tailscale'
+
+          $msi = 'C:\Windows\Temp\tailscale.msi'
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          Start-Process msiexec -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Start-Sleep -Seconds 8
+
+          # ---- decrypt the banked permanent identity, keep it aside ----
+          function Read-Decrypted([string]$src, [string]$dst) {
+            $blob = [IO.File]::ReadAllBytes($src)
+            $aes  = [System.Security.Cryptography.Aes]::Create()
+            $aes.Key = [System.Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($env:IDENTITY_KEY))
+            $ivLen  = [int]($aes.BlockSize / 8)
+            $aes.IV = [byte[]]($blob[0..($ivLen - 1)])
+            $cipher = [byte[]]($blob[$ivLen..($blob.Length - 1)])
+            [IO.File]::WriteAllBytes($dst, $aes.CreateDecryptor().TransformFinalBlock($cipher, 0, $cipher.Length))
+          }
+          $haveCanonical = $false
+          $blobPath = 'C:\ts-state\tailscaled.state.enc'
+          if ($env:X_PERSIST_IDENTITY -eq 'true' -and (Test-Path $blobPath) -and $env:IDENTITY_KEY) {
+            try {
+              Read-Decrypted $blobPath 'C:\chain\canonical.state'
+              $haveCanonical = $true
+              Write-Host 'Permanent Tailscale identity decrypted and ready.' -ForegroundColor Green
+            } catch {
+              Write-Host "Banked identity could not be decrypted ($($_.Exception.Message)) - a fresh node will be registered." -ForegroundColor Yellow
+            }
+          }
+
+          # ---- decide which name to come up as ----
+          # Chain links boot on a TEMPORARY node so they can be online and fully
+          # restored while the parent is still alive. Two live nodes sharing one
+          # identity would fight over the same IP (tailscale/tailscale#506), so the
+          # permanent identity is only claimed once the parent is offline.
+          $overlapBoot = $haveCanonical -and ([int]$env:X_DEPTH -gt 0)
+          $bootName = if ($overlapBoot) { $tempName } else { $canonical }
+          $bootMode = if ($overlapBoot) { 'temp' } else { 'canonical' }
+          if ($overlapBoot -and -not $env:TAILSCALE_AUTHKEY) {
+            Write-Host 'No TAILSCALE_AUTHKEY for the temporary node - claiming the permanent identity now instead.' -ForegroundColor Yellow
+            $bootName = $canonical; $bootMode = 'canonical'; $overlapBoot = $false
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "X_BOOT_MODE=$bootMode"
+          Add-Content -Path $env:GITHUB_ENV -Value "X_TEMP_HOSTNAME=$tempName"
+          Write-Host ("Coming up as '{0}' ({1} mode)." -f $bootName, $bootMode)
+
+          if ($bootMode -eq 'canonical' -and $haveCanonical) {
+            Stop-Service Tailscale -Force
+            New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+            Copy-Item 'C:\chain\canonical.state' "$dataDir\tailscaled.state" -Force
+            Start-Service Tailscale
+            Start-Sleep -Seconds 5
+          }
+          if ($bootMode -eq 'canonical' -and -not $haveCanonical -and -not $env:TAILSCALE_AUTHKEY) {
+            throw 'TAILSCALE_AUTHKEY secret is missing. Add it in Settings - Secrets and variables - Actions.'
+          }
+
+          $up = @('up', "--hostname=$bootName", '--accept-dns=false', '--accept-routes=true')
+          if ($env:X_EXIT_NODE -eq 'true') { $up += '--advertise-exit-node' }
+          if ($env:X_TS_ARGS) { $up += ($env:X_TS_ARGS -split '\s+' | Where-Object { $_ }) }
+
+          $ok = $false
+          for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
+            if ($attempt -gt 1) {
+              Write-Host "Attempt $attempt did not connect, re-registering from scratch..." -ForegroundColor Yellow
+              Stop-Service Tailscale -Force
+              Remove-Item "$dataDir\tailscaled.state" -Force -ErrorAction SilentlyContinue
+              Start-Service Tailscale
+              Start-Sleep -Seconds 5
+              if (-not $env:TAILSCALE_AUTHKEY) { throw 'No TAILSCALE_AUTHKEY to fall back on.' }
+            }
+            $cmd = $up.Clone()
+            if (-not (Test-Path "$dataDir\tailscaled.state")) { $cmd += "--authkey=$($env:TAILSCALE_AUTHKEY)" }
+            if ($attempt -gt 1) { $cmd += '--force-reauth' }
+            try {
+              Write-Host (& $exe @cmd 2>&1 | Out-String)
+              if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 10 }
+            } catch {
+              Write-Host "tailscale up error: $_" -ForegroundColor Red
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $ok) { throw 'Could not join the tailnet after 3 attempts.' }
+
+          Start-Sleep -Seconds 8
+          $ip4 = (& $exe ip -4) | Select-Object -First 1
+          $st  = (& $exe status --json) | ConvertFrom-Json
+          $dns = "$($st.Self.DNSName)".TrimEnd('.')
+          Add-Content -Path $env:GITHUB_ENV -Value "X_TS_IP4=$ip4"
+          Add-Content -Path $env:GITHUB_ENV -Value "X_TS_IP6=$(((& $exe ip -6) | Select-Object -First 1))"
+          Add-Content -Path $env:GITHUB_ENV -Value "X_TS_DNS=$dns"
+          Write-Host "Online as $dns -> $ip4" -ForegroundColor Green
+
+      # ── 06 · connection card ────────────────────────────────────────────────
+      - name: 06 · Publish connection details
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $start    = [DateTimeOffset]::FromUnixTimeSeconds([int64]$env:X_JOB_START).UtcDateTime
+          $deadline = $start.AddMinutes([int]$env:X_DURATION - 1)
+          $sshLine  = if ($env:X_SSH -eq 'true') { "ssh $($env:X_RDP_USER)@$($env:X_TS_IP4)" } else { 'disabled' }
+          $line     = '=' * 66
+
+          Write-Host ''
+          Write-Host $line -ForegroundColor Green
+          Write-Host '    >>>   U N L I M I T E D   R D P   I S   L I V E   <<<' -ForegroundColor Cyan
+          Write-Host $line -ForegroundColor Green
+          Write-Host ("  Address now  : {0}   ({1})" -f $env:X_TS_IP4, $env:X_TS_DNS) -ForegroundColor Yellow
+          Write-Host ("  Permanent    : {0}" -f $env:X_TS_HOSTNAME) -ForegroundColor Yellow
+          Write-Host ("  Username     : {0}  (also runneradmin)" -f $env:X_RDP_USER) -ForegroundColor Yellow
+          Write-Host ("  Password     : {0}" -f $env:X_RDP_PASS) -ForegroundColor Yellow
+          Write-Host ("  SSH          : {0}" -f $sshLine) -ForegroundColor Yellow
+          Write-Host ("  Retires at   : {0} UTC" -f $deadline.ToString('yyyy-MM-dd HH:mm')) -ForegroundColor Yellow
+          Write-Host ("  Auto-renew   : {0} (link #{1})" -f $env:X_RENEW, ([int]$env:X_DEPTH + 1)) -ForegroundColor Yellow
+          Write-Host ("  Data         : {0} mode, {1}" -f $env:X_PERSIST_MODE, $env:X_PERSIST_PATHS) -ForegroundColor Yellow
+          if ($env:X_BOOT_MODE -eq 'temp') {
+            Write-Host ("  >> This is the REPLACEMENT machine, online early on a temporary name." ) -ForegroundColor Magenta
+            Write-Host ("     The previous one ({0}) is still alive; the permanent address moves here" -f $env:X_TS_HOSTNAME) -ForegroundColor Magenta
+            Write-Host ('     automatically the moment it retires. Your data is being restored now.') -ForegroundColor Magenta
+          }
+          Write-Host ("  >> mstsc /v:{0}" -f $env:X_TS_IP4) -ForegroundColor Magenta
+          Write-Host $line -ForegroundColor Green
+
+          @"
+
+          ## Cloud RDP node $env:X_SLOT is live
+
+          | | |
+          |---|---|
+          | Address right now | ``$env:X_TS_IP4`` (``$env:X_TS_DNS``) |
+          | Permanent hostname | ``$env:X_TS_HOSTNAME`` |
+          | Mode | $(if ($env:X_BOOT_MODE -eq 'temp') { 'replacement, booted early - permanent address is claimed when the old machine retires' } else { 'primary' }) |
+          | Username | ``$env:X_RDP_USER`` (also ``runneradmin``) |
+          | Password | ``$env:X_RDP_PASS`` |
+          | SSH | ``$sshLine`` |
+          | Retires at | $($deadline.ToString('yyyy-MM-dd HH:mm')) UTC |
+          | Data persistence | ``$env:X_PERSIST_MODE`` - ``$env:X_PERSIST_PATHS`` |
+          | Runner | $env:X_RUNNER_LABEL |
+
+          Connect with ``mstsc /v:$env:X_TS_IP4``. Credentials are also in ``C:\RDP-CREDENTIALS.txt`` on the box.
+
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      # ── 07 · persistence helpers ───────────────────────────────────────────
+      - name: 07 · Write persistence helpers (rclone sync / encrypted bundle)
+        id: prep
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Path 'C:\chain','C:\rclone','C:\persist-cache' -Force | Out-Null
+
+          $paths = @($env:X_PERSIST_PATHS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          @{
+            mode    = $env:X_PERSIST_MODE
+            paths   = $paths
+            remote  = $env:X_SYNC_REMOTE
+            folder  = ('{0}/{1}-{2}' -f $env:X_SYNC_FOLDER, $env:X_TS_HOSTNAME, $env:X_SLOT)
+            exclude = @($env:X_PERSIST_EXCLUDE -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            minutes = [int]$env:X_SYNC_MINUTES
+          } | ConvertTo-Json -Depth 4 | Set-Content 'C:\chain\persist.json' -Encoding utf8
+
+          if ($env:X_PERSIST_MODE -eq 'drive') {
+            Set-Content -Path 'C:\rclone\rclone.conf' -Value $env:RCLONE_CONF -Encoding utf8
+            Write-Host 'rclone config written from the RCLONE_CONF secret.'
+          }
+
+          # ---- one script does both directions, for both backends ----
+          @'
+          param([ValidateSet('backup','restore')][string]$Direction = 'backup')
+          $ErrorActionPreference = 'Continue'
+          $cfg = Get-Content 'C:\chain\persist.json' -Raw | ConvertFrom-Json
+          function Log($m) { Write-Host ("[sync {0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }
+
+          if ($cfg.mode -eq 'none') { Log 'persistence is off'; exit 0 }
+
+          # SAFETY: never push a half-restored (or still empty) tree over a good
+          # backup - rclone sync deletes remote files that are missing locally.
+          if ($Direction -eq 'backup' -and -not (Test-Path 'C:\chain\restore.ok')) {
+            Log 'REFUSING to back up: the restore has not completed. Syncing now would delete the backup.'
+            exit 3
+          }
+
+          $rclone = 'C:\rclone\rclone.exe'
+          $conf   = 'C:\rclone\rclone.conf'
+          $stage  = 'C:\persist-cache'
+          $ex     = @()
+          foreach ($e in $cfg.exclude) { $ex += '--exclude'; $ex += $e }
+
+          function Get-KeyBytes {
+            return [System.Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($env:IDENTITY_KEY))
+          }
+          function Encrypt-FileTo([string]$src, [string]$dst) {
+            $aes = [System.Security.Cryptography.Aes]::Create()
+            $aes.Key = Get-KeyBytes
+            $aes.GenerateIV()
+            $plain  = [IO.File]::ReadAllBytes($src)
+            $cipher = $aes.CreateEncryptor().TransformFinalBlock($plain, 0, $plain.Length)
+            $blob   = New-Object byte[] ($aes.IV.Length + $cipher.Length)
+            [Array]::Copy($aes.IV, 0, $blob, 0, $aes.IV.Length)
+            [Array]::Copy($cipher, 0, $blob, $aes.IV.Length, $cipher.Length)
+            [IO.File]::WriteAllBytes($dst, $blob)
+          }
+          function Decrypt-FileTo([string]$src, [string]$dst) {
+            $blob = [IO.File]::ReadAllBytes($src)
+            $aes  = [System.Security.Cryptography.Aes]::Create()
+            $aes.Key = Get-KeyBytes
+            $ivLen  = [int]($aes.BlockSize / 8)
+            $aes.IV = [byte[]]($blob[0..($ivLen - 1)])
+            $cipher = [byte[]]($blob[$ivLen..($blob.Length - 1)])
+            [IO.File]::WriteAllBytes($dst, $aes.CreateDecryptor().TransformFinalBlock($cipher, 0, $cipher.Length))
+          }
+          function Get-SlotName([string]$p) {
+            $n = ($p -replace '[:\\/]','_').Trim('_')
+            if (-not $n) { $n = 'root' }
+            return $n
+          }
+
+          $failures = 0
+          foreach ($p in $cfg.paths) {
+            $name   = Get-SlotName $p
+            $leaf   = Split-Path $p -Leaf
+            $parent = Split-Path $p -Parent
+            if (-not $leaf -or -not $parent) {
+              Log "skipping '$p' - pass a full folder path such as D:\Workspace"
+              continue
+            }
+
+            if ($Direction -eq 'restore') {
+              if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+              New-Item -ItemType Directory -Path $p -Force | Out-Null
+              if ($cfg.mode -eq 'drive') {
+                if (-not (Test-Path $rclone)) { Log "rclone.exe missing, cannot restore $p"; $failures++; continue }
+                & $rclone copy "$($cfg.remote):$($cfg.folder)/$name" $p --config $conf `
+                  --transfers 16 --checkers 16 --fast-list --retries 3 --low-level-retries 10 --stats 2m --stats-one-line @ex
+                Log "restored $p from $($cfg.remote):$($cfg.folder)/$name (exit $LASTEXITCODE)"
+                if ($LASTEXITCODE -ne 0) { $failures++ }
+              } else {
+                $enc = Join-Path $stage "$name.tar.enc"
+                if (Test-Path $enc) {
+                  $tar = Join-Path $stage "$name.tar"
+                  try {
+                    Decrypt-FileTo $enc $tar
+                    & tar.exe -x -f $tar -C $parent @ex
+                    Log "restored $p from the encrypted bundle (exit $LASTEXITCODE)"
+                    if ($LASTEXITCODE -ne 0) { $failures++ }
+                  } catch { Log "could not decrypt/extract $name : $($_.Exception.Message)"; $failures++ }
+                  Remove-Item $tar -Force -ErrorAction SilentlyContinue
+                } else {
+                  Log "no bundle for $p yet (first run) - nothing to restore"
+                }
+              }
+            } else {
+              if ($cfg.mode -eq 'drive') {
+                if (-not (Test-Path $rclone)) { Log "rclone.exe missing, cannot back up $p"; $failures++; continue }
+                & $rclone sync $p "$($cfg.remote):$($cfg.folder)/$name" --config $conf `
+                  --transfers 16 --checkers 16 --fast-list --retries 3 --low-level-retries 10 --stats 2m --stats-one-line @ex
+                Log "backed up $p to $($cfg.remote):$($cfg.folder)/$name (exit $LASTEXITCODE)"
+                if ($LASTEXITCODE -ne 0) { $failures++ }
+              } else {
+                $tar = Join-Path $stage "$name.tar"
+                & tar.exe -c -f $tar -C $parent $leaf @ex
+                if ($LASTEXITCODE -ne 0) { Log "tar failed for $p (exit $LASTEXITCODE)"; $failures++ }
+                elseif (-not $env:IDENTITY_KEY) { Log 'no IDENTITY_KEY to encrypt with; bundle skipped'; $failures++ }
+                else {
+                  Encrypt-FileTo $tar (Join-Path $stage "$name.tar.enc")
+                  Remove-Item $tar -Force -ErrorAction SilentlyContinue
+                  Log ("bundled {0} -> {1} ({2} MB encrypted)" -f $p, "$name.tar.enc", `
+                    [math]::Round((Get-Item (Join-Path $stage "$name.tar.enc")).Length / 1MB, 1))
+                }
+              }
+            }
+          }
+
+          "$Direction finished at $(Get-Date -Format 'HH:mm:ss') with $failures failure(s)" | Set-Content 'C:\chain\sync-status.txt'
+          if ($failures -gt 0) { exit 4 }
+          exit 0
+          '@ | Set-Content -Path 'C:\chain\sync-once.ps1' -Encoding utf8
+
+          @'
+          $ErrorActionPreference = 'SilentlyContinue'
+          Start-Transcript -Path 'C:\sync.log' -Force
+          $cfg = Get-Content 'C:\chain\persist.json' -Raw | ConvertFrom-Json
+          $mins = [int]$cfg.minutes
+          if ($mins -lt 1) { $mins = 10 }
+          Write-Host "sync loop started, every $mins minute(s)"
+          while (-not (Test-Path 'C:\chain\stop-sync')) {
+            & C:\chain\sync-once.ps1 -Direction backup
+            for ($i = 0; $i -lt ($mins * 6); $i++) {
+              if (Test-Path 'C:\chain\stop-sync') { break }
+              Start-Sleep -Seconds 10
+            }
+          }
+          Write-Host 'sync loop stopped'
+          Stop-Transcript
+          '@ | Set-Content -Path 'C:\chain\sync-loop.ps1' -Encoding utf8
+
+          # rclone is needed by both the background restore and the sync loop
+          if ($env:X_PERSIST_MODE -eq 'drive') {
+            try {
+              $ProgressPreference = 'SilentlyContinue'
+              Invoke-WebRequest 'https://downloads.rclone.org/rclone-current-windows-amd64.zip' -OutFile 'C:\rclone\rclone.zip'
+              Expand-Archive 'C:\rclone\rclone.zip' -DestinationPath 'C:\rclone\tmp' -Force
+              $found = Get-ChildItem 'C:\rclone\tmp' -Recurse -Filter 'rclone.exe' | Select-Object -First 1
+              if ($found) { Copy-Item $found.FullName 'C:\rclone\rclone.exe' -Force; Write-Host "rclone ready: $((& 'C:\rclone\rclone.exe' version | Select-Object -First 1))" }
+              Remove-Item 'C:\rclone\tmp','C:\rclone\rclone.zip' -Recurse -Force -ErrorAction SilentlyContinue
+            } catch { Write-Host "rclone download failed: $($_.Exception.Message)" -ForegroundColor Red }
+          }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ready=true"
+          Write-Host 'Persistence helpers written to C:\chain\'
+
+      # ── 08 · slow work, off the critical path ───────────────────────────────
+      - name: 08 · Launch background setup (tuning, data restore, SSH, software)
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+
+          # Single-quoted here-string: no interpolation. Runs as SYSTEM, outside the
+          # runner's job object, so it keeps working while this job moves on.
+          @'
+          $ErrorActionPreference = 'SilentlyContinue'
+          $ProgressPreference    = 'SilentlyContinue'
+          Remove-Item 'C:\unlimited-setup.done' -Force
+          Start-Transcript -Path 'C:\unlimited-setup.log' -Force
+
+          function Step($t) { Write-Host ''; Write-Host "=== $t ===" -ForegroundColor Cyan }
+
+          Step 'Power: maximum performance, never sleep'
+          powercfg /setactive SCHEME_MIN
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /hibernate off
+
+          Step 'Memory: system-managed (unbounded) pagefile'
+          $cs = Get-CimInstance Win32_ComputerSystem
+          if (-not $cs.AutomaticManagedPagefile) {
+            Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true }
+            Write-Host 'Pagefile set to system-managed: it grows to fill the disk (fully active after a reboot).'
+          } else { Write-Host 'Pagefile already system-managed.' }
+
+          Step 'Network: throttling removed'
+          $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+          New-Item -Path $mm -Force | Out-Null
+          Set-ItemProperty -Path $mm -Name 'NetworkThrottlingIndex' -Value 0xffffffff -Type DWord
+          Set-ItemProperty -Path $mm -Name 'SystemResponsiveness'   -Value 0          -Type DWord
+          $qos = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched'
+          New-Item -Path $qos -Force | Out-Null
+          Set-ItemProperty -Path $qos -Name 'NonBestEffortLimit' -Value 0 -Type DWord
+          $tcp = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+          Set-ItemProperty -Path $tcp -Name 'MaxUserPort'       -Value 65534    -Type DWord
+          Set-ItemProperty -Path $tcp -Name 'TcpNumConnections' -Value 16777214 -Type DWord
+          Set-ItemProperty -Path $tcp -Name 'TcpTimedWaitDelay' -Value 30       -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' `
+            -Name 'Win32PrioritySeparation' -Value 38 -Type DWord
+          netsh int tcp set global autotuninglevel=normal | Out-Null
+          netsh int tcp set global rss=enabled            | Out-Null
+          netsh int ip set global taskoffload=enabled     | Out-Null
+
+          Step 'Windows Update: disabled, no surprise reboots'
+          $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+          New-Item -Path $au -Force | Out-Null
+          Set-ItemProperty -Path $au -Name 'NoAutoUpdate' -Value 1 -Type DWord
+          Set-ItemProperty -Path $au -Name 'AUOptions'    -Value 1 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' `
+            -Name 'NoAutoRebootWithLoggedOnUsers' -Value 1 -Type DWord
+          Get-ScheduledTask -TaskPath '\Microsoft\Windows\WindowsUpdate\','\Microsoft\Windows\UpdateAssistant\' |
+            Disable-ScheduledTask | Out-Null
+          foreach ($svc in 'wuauserv','UsoSvc','WaaSMedicSvc') {
+            Stop-Service -Name $svc -Force
+            Set-Service  -Name $svc -StartupType Disabled
+          }
+
+          Step 'Defender: real-time scanning off for speed'
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -DisableBehaviorMonitoring $true
+          Set-MpPreference -MAPSReporting Disabled
+          Add-MpPreference -ExclusionPath 'D:\','C:\Users\runneradmin\AppData\Local\Temp','C:\ProgramData\chocolatey'
+          Write-Host ("RealTimeProtection still enabled? {0} (Tamper Protection can veto this)" -f `
+            (Get-MpComputerStatus).RealTimeProtectionEnabled)
+
+          Step 'IE Enhanced Security Configuration: off (usable browser)'
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -Value 0
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -Value 0
+          rundll32.exe iesetup.dll, IEHardenAdminConfig
+
+          Step 'Misc: no Server Manager popup, no shutdown-reason dialog'
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name 'DoNotOpenServerManagerAtLogon' -Value 1 -Type DWord
+          $rel = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability'
+          New-Item -Path $rel -Force | Out-Null
+          Set-ItemProperty -Path $rel -Name 'ShutdownReasonUI' -Value 0 -Type DWord
+          New-Item -ItemType Directory -Path 'D:\Workspace' -Force | Out-Null
+
+          Step 'Restore your data'
+          $cfg = Get-Content 'C:\chain\persist.json' -Raw | ConvertFrom-Json
+          if ($cfg.mode -eq 'drive') {
+            & C:\chain\sync-once.ps1 -Direction restore
+            if ($LASTEXITCODE -eq 0) {
+              'restored' | Set-Content 'C:\chain\restore.ok'
+              Write-Host 'Data restored from the remote. Backups are now allowed.'
+            } else {
+              Write-Host "Restore reported problems (exit $LASTEXITCODE). Backups stay BLOCKED so the remote copy is never overwritten."
+            }
+          } elseif ($cfg.mode -eq 'cache') {
+            Write-Host 'Cache mode: the bundle is unpacked by the workflow itself once the old machine retires.'
+          } else {
+            'nothing to restore' | Set-Content 'C:\chain\restore.ok'
+            Write-Host 'Persistence is off.'
+          }
+
+          if ($env:X_SSH -eq 'true') {
+            Step 'OpenSSH server (second way in)'
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+            Set-Service sshd -StartupType Automatic
+            Start-Service sshd
+            if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
+                -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any | Out-Null
+            }
+            $shell = 'C:\Program Files\PowerShell\7\pwsh.exe'
+            if (-not (Test-Path $shell)) { $shell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
+            New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
+            New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value $shell -PropertyType String -Force | Out-Null
+            Write-Host "sshd running, default shell $shell"
+          }
+
+          if ($env:X_PACKAGES -and $env:X_PACKAGES -ne 'none') {
+            Step 'Chocolatey + software loadout'
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+            if (-not (Test-Path 'C:\ProgramData\chocolatey\bin\choco.exe')) {
+              iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            }
+            $env:Path += ';C:\ProgramData\chocolatey\bin'
+            foreach ($p in ($env:X_PACKAGES -split '\s+' | Where-Object { $_ })) {
+              Write-Host "--- installing $p ---"
+              & choco install -y --no-progress $p
+            }
+          }
+
+          Step 'Done'
+          Write-Host 'ALL UNLIMITED TWEAKS APPLIED'
+          Stop-Transcript
+          'done' | Set-Content 'C:\unlimited-setup.done'
+          '@ | Set-Content -Path 'C:\unlimited-setup.ps1' -Encoding utf8
+
+          $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+          if (-not (Test-Path $pwsh)) { $pwsh = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          $action    = New-ScheduledTaskAction -Execute $pwsh `
+            -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\unlimited-setup.ps1'
+          Unregister-ScheduledTask -TaskName 'UnlimitedRdpSetup' -Confirm:$false -ErrorAction SilentlyContinue
+          Register-ScheduledTask -TaskName 'UnlimitedRdpSetup' -Action $action -Principal $principal | Out-Null
+
+          # SYSTEM tasks inherit nothing from this step
+          foreach ($kv in @{ X_SSH = $env:X_SSH; X_PACKAGES = $env:X_PACKAGES; X_PERSIST_MODE = $env:X_PERSIST_MODE }.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($kv.Key, $kv.Value, 'Machine')
+          }
+
+          Start-ScheduledTask -TaskName 'UnlimitedRdpSetup'
+          Write-Host 'Background setup started as SYSTEM. Log: C:\unlimited-setup.log'
+
+      # ── 09 · periodic sync (drive mode) ────────────────────────────────────
+      - name: 09 · Start the periodic sync loop (every N minutes)
+        if: steps.boot.outputs.persist_mode == 'drive'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+          if (-not (Test-Path $pwsh)) { $pwsh = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          $action    = New-ScheduledTaskAction -Execute $pwsh `
+            -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\chain\sync-loop.ps1'
+          Unregister-ScheduledTask -TaskName 'UnlimitedRdpSync' -Confirm:$false -ErrorAction SilentlyContinue
+          Register-ScheduledTask -TaskName 'UnlimitedRdpSync' -Action $action -Principal $principal | Out-Null
+          Start-ScheduledTask -TaskName 'UnlimitedRdpSync'
+          Write-Host "Sync loop started: every $env:X_SYNC_MINUTES minute(s) to $env:X_SYNC_REMOTE:$env:X_SYNC_FOLDER (log C:\sync.log)"
+
+      # ── 10 · claim the permanent address ───────────────────────────────────
+      - name: 10 · Reclaim the permanent address when the old machine retires
+        timeout-minutes: 60
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference    = 'SilentlyContinue'
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if ($env:X_BOOT_MODE -ne 'temp') {
+            Write-Host "This machine already owns '$env:X_TS_HOSTNAME'. Nothing to reclaim."
+            exit 0
+          }
+
+          $canonical  = $env:X_TS_HOSTNAME
+          $waitMax    = [DateTime]::UtcNow.AddMinutes([int]$env:X_OVERLAP + 25)
+          $parentRun  = "$env:X_PARENT_RUN"
+          $headers    = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'rdp'; Accept = 'application/vnd.github+json' }
+          Write-Host ("Waiting for the previous '{0}' to retire (it is still serving you). Polling every 5 s, up to {1} min." -f `
+            $canonical, ([int]$env:X_OVERLAP + 25)) -ForegroundColor Cyan
+          if ($parentRun) { Write-Host "Parent job: $env:X_REPO/actions/runs/$parentRun" }
+
+          $free = $false; $parentDone = $false; $graceStart = $null; $polls = 0
+          while ([DateTime]::UtcNow -lt $waitMax) {
+            # Signal 1 (fast, exact): the parent job itself has completed.
+            if ($parentRun -and -not $parentDone) {
+              try {
+                $run = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:X_REPO/actions/runs/$parentRun"
+                if ($run.status -eq 'completed') {
+                  $parentDone = $true
+                  $graceStart = [DateTime]::UtcNow
+                  Write-Host "Parent job completed ($($run.conclusion)) - its VM is being destroyed right now." -ForegroundColor Cyan
+                }
+              } catch { }
+            }
+            # Signal 2 (authoritative): the permanent node is actually offline.
+            $st = $null
+            try { $st = (& $exe status --json) | ConvertFrom-Json } catch { }
+            if ($st) {
+              $peer = @($st.Peer.PSObject.Properties.Value | Where-Object { $_.HostName -eq $canonical })
+              if ($peer.Count -eq 0)    { Write-Host "No node named '$canonical' in the tailnet - it is free."; $free = $true; break }
+              if (-not $peer[0].Online) { Write-Host "'$canonical' is offline - claiming the permanent identity now."; $free = $true; break }
+              if ($parentDone -and (([DateTime]::UtcNow - $graceStart).TotalSeconds -ge 90)) {
+                # The job is long over, the VM is gone, Tailscale's view is just stale.
+                Write-Host 'Parent job finished 90 s ago and Tailscale still reports it online - trusting the API and claiming.' -ForegroundColor Yellow
+                $free = $true; break
+              }
+              $polls++
+              if ($polls % 12 -eq 1) {
+                Write-Host ("  still online ({0}) - your old machine is alive and serving you" -f $peer[0].TailscaleIPs[0])
+              }
+            }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $free) {
+            Write-Host "The permanent name is still occupied after the wait. Staying on the temporary address:" -ForegroundColor Yellow
+            Write-Host ("  {0}  - reconnect here; the permanent name was not claimed." -f $env:X_TS_IP4) -ForegroundColor Yellow
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "`nStaying on the temporary address ``$env:X_TS_IP4``: the permanent name was still occupied.`n"
+            exit 0
+          }
+
+          # Keep the temporary state so a failed claim can be rolled back.
+          Copy-Item 'C:\ProgramData\Tailscale\tailscaled.state' 'C:\chain\temp.state' -Force
+          & $exe logout 2>&1 | Out-Null            # removes the temporary node from the tailnet
+          Start-Sleep -Seconds 3
+          Stop-Service Tailscale -Force
+          Copy-Item 'C:\chain\canonical.state' 'C:\ProgramData\Tailscale\tailscaled.state' -Force
+          Start-Service Tailscale
+          Start-Sleep -Seconds 5
+
+          $claimed = $false
+          for ($i = 1; $i -le 3 -and -not $claimed; $i++) {
+            $out = & $exe up --hostname=$canonical --accept-dns=false --accept-routes=true 2>&1 | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -eq 0) { $claimed = $true } else { Start-Sleep -Seconds 8 }
+          }
+
+          if (-not $claimed) {
+            Write-Host 'Could not claim the permanent identity - rolling back to the temporary one.' -ForegroundColor Red
+            Stop-Service Tailscale -Force
+            Copy-Item 'C:\chain\temp.state' 'C:\ProgramData\Tailscale\tailscaled.state' -Force
+            Start-Service Tailscale
+            Start-Sleep -Seconds 5
+            & $exe up --hostname=$env:X_TEMP_HOSTNAME --accept-dns=false --accept-routes=true --force-reauth `
+              --authkey="$($env:TAILSCALE_AUTHKEY)" 2>&1 | Out-String | Write-Host
+          }
+
+          Start-Sleep -Seconds 8
+          $ip4 = (& $exe ip -4) | Select-Object -First 1
+          $st  = (& $exe status --json) | ConvertFrom-Json
+          $dns = "$($st.Self.DNSName)".TrimEnd('.')
+          Add-Content -Path $env:GITHUB_ENV -Value "X_TS_IP4_PERM=$ip4"
+          Add-Content -Path $env:GITHUB_ENV -Value "X_TS_DNS_PERM=$dns"
+
+          Write-Host ''
+          Write-Host '================================================================' -ForegroundColor Green
+          Write-Host ("  PERMANENT ADDRESS CLAIMED: {0}  ({1})" -f $ip4, $dns) -ForegroundColor Cyan
+          Write-Host ("  If you were connected to the temporary address, reconnect to {0}" -f $ip4) -ForegroundColor Yellow
+          Write-Host '================================================================' -ForegroundColor Green
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "`n### Hand-over complete`n`nThe permanent address is back on this machine: ``$ip4`` (``$dns``). Data top-up restore is running now.`n"
+
+      # ── 10b · grab the retiring machine's FINAL bundle ─────────────────────
+      # Step 04 ran minutes before the old machine retired, so it could only see an
+      # older bundle. Now that it is gone, its last upload exists - fetch that one.
+      - name: 10b · Restore the retiring machine's final bundle (cache mode)
+        if: steps.boot.outputs.persist_mode == 'cache'
+        id: data_restore_final
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\persist-cache-final
+          key: datafinal-${{ steps.boot.outputs.hostname }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: data-${{ steps.boot.outputs.hostname }}-
+          fail-on-cache-miss: false
+
+      # ── 11 · finish the data hand-over ─────────────────────────────────────
+      - name: 11 · Finish restoring your data
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+
+          if ($env:X_PERSIST_MODE -eq 'drive') {
+            # Top-up: picks up whatever the retired machine uploaded in its final sync.
+            Write-Host 'Running the top-up restore (incremental, only what changed at the end)...'
+            & C:\chain\sync-once.ps1 -Direction restore
+            if ($LASTEXITCODE -eq 0) { 'restored' | Set-Content 'C:\chain\restore.ok' }
+          } elseif ($env:X_PERSIST_MODE -eq 'cache') {
+            # Prefer the bundle the retiring machine uploaded minutes ago over the
+            # older one step 04 could see.
+            $final = 'C:\persist-cache-final'
+            if (Test-Path $final) {
+              $newer = @(Get-ChildItem $final -Filter '*.tar.enc' -ErrorAction SilentlyContinue)
+              if ($newer.Count -gt 0) {
+                $newer | ForEach-Object { Copy-Item $_.FullName 'C:\persist-cache\' -Force }
+                Write-Host ("Using the retiring machine's final bundle ({0} file(s))." -f $newer.Count)
+              } else {
+                Write-Host 'No newer bundle found; unpacking the one restored at boot.'
+              }
+            }
+            Write-Host 'Unpacking the encrypted data bundle...'
+            & C:\chain\sync-once.ps1 -Direction restore
+            if ($LASTEXITCODE -eq 0 -and (Get-ChildItem 'C:\persist-cache' -Filter '*.tar.enc' -ErrorAction SilentlyContinue)) {
+              'restored' | Set-Content 'C:\chain\restore.ok'
+            } elseif ($LASTEXITCODE -eq 0) {
+              'first run, nothing to restore' | Set-Content 'C:\chain\restore.ok'
+            }
+          } else {
+            'persistence off' | Set-Content 'C:\chain\restore.ok'
+          }
+
+          foreach ($p in ($env:X_PERSIST_PATHS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            if (Test-Path $p) {
+              $size = (Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+              Write-Host ("  {0}: {1} files, {2} MB" -f $p, `
+                @(Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue).Count, [math]::Round($size / 1MB, 1))
+            }
+          }
+          if (Test-Path 'C:\chain\sync-status.txt') { Write-Host (Get-Content 'C:\chain\sync-status.txt' -Raw) }
+
+          # A record that lives inside your synced folder, so the chain's whole
+          # history travels with your data and you can read it from inside the box.
+          $first = @($env:X_PERSIST_PATHS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })[0]
+          if ($first -and (Test-Path $first)) {
+            $hist = Join-Path $first '.vpsmajani-handover.log'
+            $curIp = (& 'C:\Program Files\Tailscale\tailscale.exe' ip -4 2>$null) | Select-Object -First 1
+            Add-Content -Path $hist -Value ("{0} | link #{1} | {2} | {3} | persist={4} | user={5}" -f `
+              (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), ([int]$env:X_DEPTH + 1), $env:X_TS_HOSTNAME, $curIp, `
+              $env:X_PERSIST_MODE, $env:X_RDP_USER)
+            Write-Host "Hand-over history appended to $hist (this file travels with your data)."
+            Write-Host '--- last 5 hand-overs ---'
+            Get-Content $hist -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+          }
+
+      # ── 12 · bank the permanent identity ───────────────────────────────────
+      - name: 12 · Bank the (encrypted) Tailscale identity
+        id: stage_identity
+        run: |
+          # Deliberately non-fatal: the machine is live and your data is on it, so a
+          # banking problem must never tear it down.
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Path 'C:\ts-state' -Force | Out-Null
+          '{0} | slot {1} | run {2}' -f $env:X_TS_HOSTNAME, $env:X_SLOT, $env:GITHUB_RUN_ID |
+            Set-Content 'C:\ts-state\IDENTITY.txt'
+
+          if ($env:X_PERSIST_IDENTITY -ne 'true') {
+            Write-Host 'persist_identity=false - the next machine gets a fresh node and a new IP.'
+          } elseif (-not $env:IDENTITY_KEY) {
+            Write-Host 'No key secret to encrypt with - identity not banked.'
+          } else {
+            try {
+              # The decrypted permanent state is what the next link needs, whether or
+              # not this machine managed to claim it. Fall back to the live state on a
+              # first boot, where no permanent state was banked yet.
+              $src = if (Test-Path 'C:\chain\canonical.state') { 'C:\chain\canonical.state' } else { 'C:\ProgramData\Tailscale\tailscaled.state' }
+              if (-not (Test-Path $src)) { throw "state file missing at $src" }
+              $aes = [System.Security.Cryptography.Aes]::Create()
+              $aes.Key = [System.Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($env:IDENTITY_KEY))
+              $aes.GenerateIV()
+              $plain  = [IO.File]::ReadAllBytes($src)
+              $cipher = $aes.CreateEncryptor().TransformFinalBlock($plain, 0, $plain.Length)
+              $blob   = New-Object byte[] ($aes.IV.Length + $cipher.Length)
+              [Array]::Copy($aes.IV, 0, $blob, 0, $aes.IV.Length)
+              [Array]::Copy($cipher, 0, $blob, $aes.IV.Length, $cipher.Length)
+              [IO.File]::WriteAllBytes('C:\ts-state\tailscaled.state.enc', $blob)
+              Write-Host ("Identity encrypted and staged from {0} ({1} -> {2} bytes)." -f $src, $plain.Length, $blob.Length)
+            } catch {
+              Write-Host "Could not bank the identity: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+          }
+
+      - name: 13 · Cache identity
+        if: steps.stage_identity.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\ts-state
+          key: tsid-${{ steps.boot.outputs.hostname }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── 14 · stay alive, hand over, final sync ─────────────────────────────
+      - name: 14 · Keep alive, sync, and hand over to the replacement
+        id: alive
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference    = 'SilentlyContinue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          $start    = [DateTimeOffset]::FromUnixTimeSeconds([int64]$env:X_JOB_START).UtcDateTime
+          $duration = [int]$env:X_DURATION
+          $deadline = $start.AddMinutes($duration - 1)   # 1 min of slack before the platform kill
+
+          # Reserve enough runway for the last backup and, in cache mode, for the
+          # snapshot + upload steps that run after this loop.
+          $backupLead = switch ($env:X_PERSIST_MODE) { 'drive' { 6 } 'cache' { 16 } default { 2 } }
+          $handoverAt = $deadline.AddMinutes(-[math]::Max([int]$env:X_OVERLAP, $backupLead + 6))
+          $loopEnd    = $deadline.AddMinutes(-($backupLead - 2))
+
+          $renewOn = $env:X_RENEW -eq 'true'
+          $renewed = $false
+          $synced  = $false
+          $tick    = 0
+
+          Write-Host ("Retires {0} UTC | replacement queued at {1} UTC | final backup at {2} UTC | loop ends {3} UTC" -f `
+            $deadline.ToString('HH:mm'), $handoverAt.ToString('HH:mm'), `
+            $deadline.AddMinutes(-$backupLead).ToString('HH:mm'), $loopEnd.ToString('HH:mm')) -ForegroundColor Cyan
+
+          while ([DateTime]::UtcNow -lt $loopEnd) {
+            Start-Sleep -Seconds 60
+            $tick++
+            $now = [DateTime]::UtcNow
+
+            if ($tick % 5 -eq 1) {
+              $os      = Get-CimInstance Win32_OperatingSystem
+              $load    = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+              $freeRam = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+              $d       = Get-PSDrive -Name D -ErrorAction SilentlyContinue
+              $freeD   = if ($d) { [math]::Round($d.Free / 1GB, 1) } else { 'n/a' }
+              $rdp     = @(qwinsta 2>$null | Select-String -Pattern '^\s*>?rdp').Count
+              $setup   = if (Test-Path 'C:\unlimited-setup.done') { 'setup DONE' } else { 'setup running' }
+              $curIp   = (& $exe ip -4 2>$null) | Select-Object -First 1
+              $syncTxt = 'not yet'
+              if (Test-Path 'C:\chain\sync-status.txt') {
+                $raw = Get-Content 'C:\chain\sync-status.txt' -Raw -ErrorAction SilentlyContinue
+                if ($raw) { $syncTxt = $raw.Trim() }
+              }
+              Write-Host ("[{0,4}] {1} UTC | {2,3} min left | CPU {3}% | RAM free {4} GB | D: free {5} GB | RDP {6} | {7} | {8} | sync: {9}" -f `
+                $tick, $now.ToString('HH:mm'), [int]($deadline - $now).TotalMinutes, $load, $freeRam, $freeD, $rdp, $setup, $curIp, $syncTxt)
+              if ($setup -eq 'setup running') {
+                Get-Content 'C:\unlimited-setup.log' -Tail 2 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "         | $_" }
+              }
+            } else {
+              Write-Host ("[{0,4}] alive - {1} min left" -f $tick, [int]($deadline - $now).TotalMinutes)
+            }
+
+            # Hand-over: retry every minute until it lands, so a transient API blip
+            # can never be the reason the chain dies.
+            if ($renewOn -and -not $renewed -and $now -ge $handoverAt) {
+              Write-Host 'Hand-over window open - booting the replacement machine now (this one stays up).' -ForegroundColor Cyan
+              & C:\chain\renew.ps1
+              if ($LASTEXITCODE -eq 1) { Write-Host 'Dispatch failed, retrying next heartbeat.' -ForegroundColor Yellow } else { $renewed = $true }
+            }
+
+            # Final drive sync, while there is still runway left. Cache mode does its
+            # bundle in step 15 instead, because only a step can upload to the cache.
+            if (-not $synced -and $env:X_PERSIST_MODE -eq 'drive' -and $now -ge $deadline.AddMinutes(-$backupLead)) {
+              $synced = $true
+              Write-Host 'Final backup: stopping the sync loop and pushing everything one last time...' -ForegroundColor Cyan
+              'stop' | Set-Content 'C:\chain\stop-sync'
+              Start-Sleep -Seconds 5
+              & C:\chain\sync-once.ps1 -Direction backup
+              Write-Host "Final backup exit code: $LASTEXITCODE"
+            }
+          }
+
+          Write-Host ''
+          Write-Host "Time budget spent ($duration min). GitHub reclaims this machine now." -ForegroundColor Yellow
+          if ($renewOn -and $renewed) {
+            Write-Host 'Your replacement has been online for a while and already has your data - nothing is interrupted.' -ForegroundColor Cyan
+          } elseif (-not $renewOn) {
+            Write-Host 'Auto-renew was off, so this is the end of the line.' -ForegroundColor Cyan
+          }
+
+      # ── 15/16 · cache-mode bundle ──────────────────────────────────────────
+      - name: 15 · Snapshot the data bundle (cache mode)
+        if: steps.boot.outputs.persist_mode == 'cache'
+        id: snapshot
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          'stop' | Set-Content 'C:\chain\stop-sync'
+          & C:\chain\sync-once.ps1 -Direction backup
+          Write-Host "Snapshot exit code: $LASTEXITCODE"
+          Get-ChildItem 'C:\persist-cache' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host ("  {0}  {1} MB" -f $_.Name, [math]::Round($_.Length / 1MB, 1))
+          }
+
+      - name: 16 · Cache the data bundle
+        if: steps.boot.outputs.persist_mode == 'cache' && steps.snapshot.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\persist-cache
+          key: data-${{ steps.boot.outputs.hostname }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── 17 · crash recovery ────────────────────────────────────────────────
+      - name: 17 · Self-heal - queue a replacement even though this job failed
+        if: failure()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          if (Test-Path 'C:\chain\renew.ps1') {
+            Write-Host 'This machine died early. Trying to keep the chain alive anyway...' -ForegroundColor Yellow
+            & C:\chain\renew.ps1 -SelfHeal
+            Write-Host "renew.ps1 exit code: $LASTEXITCODE (0 dispatched, 1 retry impossible, 2 deliberately not chaining)"
+          } else {
+            Write-Host 'The chain helper was never written; nothing to self-heal with.' -ForegroundColor Yellow
+          }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  #  Emergency brake
+  #  gh api repos/OWNER/REPO/dispatches -f event_type=rdp-stop
+  # ───────────────────────────────────────────────────────────────────────────
+  stop:
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'rdp-stop'
+    name: 'Emergency stop'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel every queued and running RDP job
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:  ${{ github.repository }}
+        run: |
+          echo "Cancelling all in-flight runs of windows-rdp.yml except this one..."
+          for status in in_progress queued requested waiting; do
+            gh run list --workflow windows-rdp.yml --status "$status" \
+              --json databaseId --jq '.[].databaseId' 2>/dev/null | while read -r id; do
+              if [ "$id" != "$GITHUB_RUN_ID" ]; then
+                if gh run cancel "$id" 2>/dev/null; then echo "  cancelled run $id"; else echo "  could not cancel run $id"; fi
+              fi
+            done
+          done
+          echo
+          echo "Running machines are gone. To make sure no chain link comes back:"
+          echo "  * create a file named STOP-RDP at the repository root, or"
+          echo "  * set the repository variable RDP_CHAIN_ENABLED = false"
+          echo "    (Settings -> Secrets and variables -> Actions -> Variables)"
