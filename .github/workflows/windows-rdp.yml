@@ -212,7 +212,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV    -Value "X_HEALS=$([int](Get-Opt 'heals' 0))"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_MAX_CHAIN=$([int](Get-Opt 'max_chain' 0))"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_SSH=$(Get-Flag 'ssh' $true)"
-          Add-Content -Path $env:GITHUB_ENV    -Value "X_EXIT_NODE=$(Get-Flag 'exit_node' $false)"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_EXIT_NODE=$(Get-Flag 'exit_node' $true)"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_RESET_RUNNER=$(Get-Flag 'reset_runneradmin' $true)"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_IDENTITY=$(Get-Flag 'persist_identity' $true)"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_TS_ARGS=$(Get-Opt 'tailscale_args' '')"
