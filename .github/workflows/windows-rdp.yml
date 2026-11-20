@@ -97,7 +97,7 @@ on:
       persist_paths:
         description: 'Folders to keep, comma separated (D:\Workspace + user profile folders)'
         required: false
-        default: 'D:\Workspace,C:\Users\NvDAdmin\Desktop,C:\Users\NvDAdmin\Documents,C:\Users\NvDAdmin\Downloads,C:\Users\NvDAdmin\AppData\Roaming,C:\Users\NvDAdmin\AppData\Local\Google\Chrome,C:\Users\NvDAdmin\AppData\Local\Microsoft\Edge'
+        default: 'D:\Workspace,C:\Users\NvDAdmin'
       options:
         description: 'Advanced JSON - see README. Keys: max_chain, depth, heals, ssh, exit_node, reset_runneradmin, persist_identity, tailscale_args, sync_remote, sync_folder, sync_minutes, persist_exclude'
         required: false
@@ -149,7 +149,7 @@ jobs:
       X_HOSTNAME_BASE:  ${{ github.event.inputs.hostname || github.event.client_payload.hostname || 'github-rdp-server' }}
       X_PACKAGES:       ${{ github.event.inputs.packages || github.event.client_payload.packages || 'googlechrome firefox 7zip git python nodejs-lts vscode vlc' }}
       X_PERSIST_MODE_IN: ${{ github.event.inputs.persist_mode || github.event.client_payload.persist_mode || 'auto' }}
-      X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace,C:\Users\NvDAdmin\Desktop,C:\Users\NvDAdmin\Documents,C:\Users\NvDAdmin\Downloads,C:\Users\NvDAdmin\AppData\Roaming,C:\Users\NvDAdmin\AppData\Local\Google\Chrome,C:\Users\NvDAdmin\AppData\Local\Microsoft\Edge' }}
+      X_PERSIST_PATHS:  ${{ github.event.inputs.persist_paths || github.event.client_payload.persist_paths || 'D:\Workspace,C:\Users\NvDAdmin' }}
       X_OPTIONS_RAW:    ${{ github.event.inputs.options || github.event.client_payload.options || '{}' }}
       X_RDP_USER:       NvDAdmin
       X_WORKFLOW_FILE:  windows-rdp.yml
@@ -219,7 +219,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV    -Value "X_SYNC_REMOTE=$(Get-Opt 'sync_remote' 'gdrive')"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_SYNC_FOLDER=$(Get-Opt 'sync_folder' 'vpsmajani')"
           Add-Content -Path $env:GITHUB_ENV    -Value "X_SYNC_MINUTES=$([int](Get-Opt 'sync_minutes' 10))"
-          Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_EXCLUDE=$(Get-Opt 'persist_exclude' '$RECYCLE.BIN/**,*/AppData/Local/Temp/**,*.tmp,pagefile.sys,hiberfil.sys,User Data/*/Cache/**,User Data/*/Code Cache/**,*/AppData/Local/Google/Chrome/User Data/*/Cache/**,*/AppData/Local/Google/Chrome/User Data/*/Code Cache/**,*/AppData/Local/Microsoft/Edge/User Data/*/Cache/**,*/AppData/Local/Microsoft/Edge/User Data/*/Code Cache/**')"
+          Add-Content -Path $env:GITHUB_ENV    -Value "X_PERSIST_EXCLUDE=$(Get-Opt 'persist_exclude' '$RECYCLE.BIN/**,*/AppData/Local/Temp/**,*/AppData/Local/Temp/**,NTUSER.DAT*,ntuser.dat*,*.tmp,pagefile.sys,hiberfil.sys,swapfile.sys,User Data/*/Cache/**,User Data/*/Code Cache/**,*/AppData/Local/Google/Chrome/User Data/*/Cache/**,*/AppData/Local/Google/Chrome/User Data/*/Code Cache/**,*/AppData/Local/Microsoft/Edge/User Data/*/Cache/**,*/AppData/Local/Microsoft/Edge/User Data/*/Code Cache/**')"
 
           Write-Host "Tailscale identity : $host_name (slot $env:X_SLOT of $($slots.Count))"
           Write-Host "Chain link         : #$([int](Get-Opt 'depth' 0) + 1), heals $([int](Get-Opt 'heals' 0))/$env:X_MAX_HEALS"
